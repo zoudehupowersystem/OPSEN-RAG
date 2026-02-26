@@ -1,4 +1,5 @@
 from pathlib import Path
+from io import BytesIO
 import networkx as nx
 from sentence_transformers import SentenceTransformer
 import pickle
@@ -9,13 +10,101 @@ from bs4 import BeautifulSoup
 import re
 import numpy as np
 from typing import List, Tuple, Dict, Any
+import base64
 import jieba
-import numpy as np
+import fitz
 from vector_store import VectorStore # 导入 VectorStore 类
 
+
+class PDFToMarkdownConverter:
+    """使用多模态模型将 PDF 转换为 Markdown。"""
+
+    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220):
+        self.model = model
+        self.page_dpi = page_dpi
+
+    def convert(self, pdf_path: Path, output_dir: Path) -> Path:
+        """将 PDF 文件转换为 Markdown 文件。"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{pdf_path.stem}.md"
+
+        doc = fitz.open(pdf_path)
+        page_markdowns = []
+        for page_index, page in enumerate(doc, 1):
+            page_image_b64 = self._render_page_to_base64(page)
+            page_markdown = self._recognize_markdown(page_image_b64, page_index)
+            page_markdowns.append(page_markdown)
+
+        markdown_text = "\n\n".join(page_markdowns)
+        output_path.write_text(markdown_text, encoding="utf-8")
+        return output_path
+
+    def _render_page_to_base64(self, page) -> str:
+        """渲染页面为图片并编码为 base64。"""
+        scale = self.page_dpi / 72
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        image_buffer = BytesIO(pix.tobytes("png"))
+        return base64.b64encode(image_buffer.getvalue()).decode("utf-8")
+
+    def _recognize_markdown(self, image_b64: str, page_index: int) -> str:
+        """通过多模态模型识别页面内容并输出 Markdown。"""
+        prompt = (
+            "你是一个 PDF 到 Markdown 的专业转换助手。"
+            "请将这页 PDF 内容严格转换为 Markdown，要求：\n"
+            "1) 保留标题、列表、表格和段落结构。\n"
+            "2) 所有公式必须识别为 LaTeX。独立一行公式使用 $$...$$ 包裹并单独成行；"
+            "行内公式使用 $...$。\n"
+            "3) 如果页面有图片，请不要输出图片链接，改为在对应位置写简要中文描述，格式为："
+            "[图示说明：...]。\n"
+            "4) 仅输出 Markdown 内容，不要解释，不要添加额外前后缀。"
+        )
+
+        response = ollama.chat(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [image_b64],
+                }
+            ],
+            options={
+                "temperature": 0,
+            },
+        )
+
+        content = response.get("message", {}).get("content", "").strip()
+        if not content:
+            return f"## 第 {page_index} 页\n\n[图示说明：该页未识别到可用文本内容。]"
+        return content
+
 class DocumentProcessor:
-    def __init__(self):
+    def __init__(self, pdf_model: str = "qwen3-vl:8b"):
         self.encoder = SentenceTransformer('shibing624/text2vec-base-chinese')
+        self.pdf_converter = PDFToMarkdownConverter(model=pdf_model)
+
+    def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
+        """将目录内 PDF 转换为 Markdown。"""
+        converted_files = []
+        pdf_files = sorted(data_dir.glob("*.pdf"))
+
+        for pdf_file in pdf_files:
+            output_md = data_dir / f"{pdf_file.stem}.md"
+            if output_md.exists() and output_md.stat().st_mtime >= pdf_file.stat().st_mtime:
+                print(f"跳过 PDF 转换（Markdown 已是最新）: {pdf_file.name}")
+                converted_files.append(output_md)
+                continue
+
+            print(f"开始转换 PDF -> Markdown: {pdf_file.name}")
+            try:
+                converted_path = self.pdf_converter.convert(pdf_file, data_dir)
+                converted_files.append(converted_path)
+                print(f"PDF 转换完成: {converted_path.name}")
+            except Exception as e:
+                print(f"PDF 转换失败 {pdf_file.name}: {e}")
+
+        return converted_files
 
     def process_markdown(self, file_path: str) -> list:
         """处理单个Markdown文件为文本块。"""
@@ -326,6 +415,7 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
     def process_documents(self):
         """处理文档，构建向量索引和知识图谱。"""
         all_chunks = []
+        self.processor.convert_pdfs_to_markdown(self.data_dir)
         md_files = list(self.data_dir.glob("*.md"))
         total_files = len(md_files)
 
