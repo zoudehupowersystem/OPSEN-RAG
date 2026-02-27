@@ -47,12 +47,13 @@ def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chine
 class PDFToMarkdownConverter:
     """使用多模态模型将 PDF 按页转换为 Markdown。"""
 
-    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 3, retry_wait_s: float = 2.0):
+    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 3, retry_wait_s: float = 2.0, release_vram_each_page: bool = True):
         self.model = model
         self.page_dpi = page_dpi
         self.show_llm_interaction = show_llm_interaction
         self.max_retries = max_retries
         self.retry_wait_s = retry_wait_s
+        self.release_vram_each_page = release_vram_each_page
 
     def get_page_count(self, pdf_path: Path) -> int:
         """获取 PDF 页数。"""
@@ -155,9 +156,10 @@ class PDFToMarkdownConverter:
                 if self.show_llm_interaction:
                     print(
                         f"    [LLM请求] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, "
-                        f"模型={self.model}, prompt长度={len(prompt)}"
+                        f"模型={self.model}, keep_alive={'0s' if self.release_vram_each_page else '5m'}, prompt长度={len(prompt)}"
                     )
 
+                keep_alive = "0s" if self.release_vram_each_page else "5m"
                 response = ollama.chat(
                     model=self.model,
                     messages=[
@@ -170,6 +172,7 @@ class PDFToMarkdownConverter:
                     options={
                         "temperature": 0,
                     },
+                    keep_alive=keep_alive,
                 )
 
                 content = response.get("message", {}).get("content", "").strip()
@@ -196,9 +199,9 @@ class PDFToMarkdownConverter:
         raise RuntimeError(f"LLM识别失败（重试{self.max_retries}次后仍失败）: {last_error}")
 
 class DocumentProcessor:
-    def __init__(self, pdf_model: str = "qwen3-vl:8b", encoder=None):
+    def __init__(self, pdf_model: str = "qwen3-vl:8b", encoder=None, release_vram_each_page: bool = True):
         self.encoder = encoder or get_shared_embedding_model()
-        self.pdf_converter = PDFToMarkdownConverter(model=pdf_model)
+        self.pdf_converter = PDFToMarkdownConverter(model=pdf_model, release_vram_each_page=release_vram_each_page)
 
     def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
         """将目录内 PDF 按页转换为 Markdown。"""
