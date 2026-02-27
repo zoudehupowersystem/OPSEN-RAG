@@ -46,9 +46,10 @@ def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chine
 class PDFToMarkdownConverter:
     """使用多模态模型将 PDF 按页转换为 Markdown。"""
 
-    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220):
+    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220, show_llm_interaction: bool = True):
         self.model = model
         self.page_dpi = page_dpi
+        self.show_llm_interaction = show_llm_interaction
 
     def get_page_count(self, pdf_path: Path) -> int:
         """获取 PDF 页数。"""
@@ -66,17 +67,26 @@ class PDFToMarkdownConverter:
     def convert(self, pdf_path: Path, output_dir: Path) -> List[Path]:
         """将 PDF 文件按页转换为 Markdown 文件（`*_1.md` ... `*_N.md`）。"""
         output_dir.mkdir(parents=True, exist_ok=True)
+        fig_dir = output_dir / "figs"
+        fig_dir.mkdir(parents=True, exist_ok=True)
 
         doc = fitz.open(pdf_path)
         output_paths = []
+        figure_paths = []
         try:
+            total_pages = doc.page_count
+            print(f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页")
             for page_index, page in enumerate(doc, 1):
                 output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
+                figure_path = fig_dir / f"{pdf_path.stem}_{page_index}.png"
                 try:
-                    page_image_b64 = self._render_page_to_base64(page)
-                    page_markdown = self._recognize_markdown(page_image_b64, page_index)
+                    print(f"  -> 处理第 {page_index}/{total_pages} 页")
+                    page_image_b64 = self._render_page_to_base64(page, figure_path)
+                    page_markdown = self._recognize_markdown(page_image_b64, page_index, pdf_path.name)
                     output_path.write_text(page_markdown, encoding="utf-8")
                     output_paths.append(output_path)
+                    figure_paths.append(figure_path)
+                    print(f"  -> 第 {page_index} 页完成，输出: {output_path.name}，中间图像: figs/{figure_path.name}")
                 except Exception as e:
                     raise RuntimeError(
                         f"第 {page_index} 页识别失败（model={self.model}, dpi={self.page_dpi}）: {e}"
@@ -90,22 +100,30 @@ class PDFToMarkdownConverter:
             legacy_path.unlink()
 
         stale_page_files = sorted(output_dir.glob(f"{pdf_path.stem}_*.md"))
-        valid_names = {p.name for p in output_paths}
+        valid_page_names = {p.name for p in output_paths}
         for stale_file in stale_page_files:
-            if stale_file.name not in valid_names:
+            if stale_file.name not in valid_page_names:
+                stale_file.unlink()
+
+        stale_fig_files = sorted(fig_dir.glob(f"{pdf_path.stem}_*.png"))
+        valid_fig_names = {p.name for p in figure_paths}
+        for stale_file in stale_fig_files:
+            if stale_file.name not in valid_fig_names:
                 stale_file.unlink()
 
         return output_paths
 
-    def _render_page_to_base64(self, page) -> str:
-        """渲染页面为图片并编码为 base64。"""
+    def _render_page_to_base64(self, page, figure_path: Path) -> str:
+        """渲染页面为图片，保存到 figs 目录并编码为 base64。"""
         scale = self.page_dpi / 72
         matrix = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=matrix, alpha=False)
-        image_buffer = BytesIO(pix.tobytes("png"))
+        image_bytes = pix.tobytes("png")
+        figure_path.write_bytes(image_bytes)
+        image_buffer = BytesIO(image_bytes)
         return base64.b64encode(image_buffer.getvalue()).decode("utf-8")
 
-    def _recognize_markdown(self, image_b64: str, page_index: int) -> str:
+    def _recognize_markdown(self, image_b64: str, page_index: int, pdf_name: str) -> str:
         """通过多模态模型识别页面内容并输出 Markdown。"""
         prompt = (
             "你是一个 PDF 到 Markdown 的专业转换助手。"
@@ -117,6 +135,9 @@ class PDFToMarkdownConverter:
             "[图示说明：...]。\n"
             "4) 仅输出 Markdown 内容，不要解释，不要添加额外前后缀。"
         )
+
+        if self.show_llm_interaction:
+            print(f"    [LLM请求] 文件={pdf_name}, 页={page_index}, 模型={self.model}, prompt长度={len(prompt)}")
 
         response = ollama.chat(
             model=self.model,
@@ -133,6 +154,9 @@ class PDFToMarkdownConverter:
         )
 
         content = response.get("message", {}).get("content", "").strip()
+        if self.show_llm_interaction:
+            preview = content[:200].replace("\n", " ")
+            print(f"    [LLM响应] 文件={pdf_name}, 页={page_index}, 返回长度={len(content)}, 预览={preview}")
         if not content:
             return f"## 第 {page_index} 页\n\n[图示说明：该页未识别到可用文本内容。]"
         return content
