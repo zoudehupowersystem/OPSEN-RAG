@@ -53,6 +53,103 @@
     ollama run qwen3-vl:8b
     ```
 
+## Linux 环境详细操作流程
+
+以下以 Ubuntu 为例，其他 Linux 发行版命令基本相同。
+
+1. **安装系统依赖（可选但推荐）**
+
+   ```bash
+   sudo apt update
+   sudo apt install -y python3 python3-pip python3-venv git
+   ```
+
+2. **克隆并进入项目目录**
+
+   ```bash
+   git clone <你的仓库 URL>
+   cd <你的仓库名称>
+   ```
+
+3. **创建并激活虚拟环境（推荐）**
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+
+4. **安装 Python 依赖**
+
+   ```bash
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
+
+5. **准备 Ollama 与模型**
+
+   ```bash
+   ollama run deepseek-r1:7b
+   ollama run qwen3-vl:8b
+   ```
+
+6. **运行程序**
+
+   ```bash
+   python main.py
+   ```
+
+---
+
+## Windows 11 + VSCode 详细操作流程
+
+以下流程适用于你当前这种在 VSCode 中直接运行 `.py` 的场景。
+
+1. **在 VSCode 打开项目根目录**
+   - 必须打开包含 `main.py` 和 `requirements.txt` 的目录。
+
+2. **选择正确 Python 解释器**
+   - 按 `Ctrl + Shift + P`，选择 `Python: Select Interpreter`。
+   - 选择你的 Conda 环境解释器，例如：
+     `C:/Users/1/.conda/envs/torch/python.exe`。
+
+3. **打开 VSCode 终端并确认环境**
+
+   ```powershell
+   python -c "import sys; print(sys.executable)"
+   python -c "import os; print(os.getcwd())"
+   ```
+
+   - 第一个命令应输出你选择的解释器路径。
+   - 第二个命令应是项目根目录路径。
+
+4. **安装依赖（务必在项目根目录执行）**
+
+   ```powershell
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
+
+   > 若出现 `No such file or directory: requirements.txt`，说明终端不在项目目录，请先 `cd` 到项目目录再执行。
+
+5. **准备 Ollama 模型**
+
+   ```powershell
+   ollama run deepseek-r1:7b
+   ollama run qwen3-vl:8b
+   ```
+
+6. **运行程序**
+
+   ```powershell
+   python main.py
+   ```
+
+7. **（可选）配置 VSCode 一键运行**
+   - 创建 `.vscode/launch.json`，将 `program` 指向 `${workspaceFolder}/main.py`，`cwd` 设为 `${workspaceFolder}`。
+   - 这样点击运行按钮时路径不会错位。
+
+---
+
 ## 使用方法
 
 1.  **运行应用程序：**
