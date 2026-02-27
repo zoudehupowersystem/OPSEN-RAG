@@ -1,7 +1,13 @@
 from pathlib import Path
-from graph_rag import ImprovedGraphRAG # 导入 ImprovedGraphRAG 类
 
 if __name__ == "__main__":
+    try:
+        from graph_rag import ImprovedGraphRAG  # 导入 ImprovedGraphRAG 类
+    except ModuleNotFoundError as e:
+        print(f"依赖缺失，无法启动程序: {e}")
+        print("请先安装依赖，例如: pip install -r requirements.txt")
+        raise
+
     data_dir = "data"  # 数据目录
     save_dir = "model_files" # 模型保存目录
     graph_rag = ImprovedGraphRAG(data_dir=data_dir, save_dir=save_dir) # 初始化 ImprovedGraphRAG

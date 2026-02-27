@@ -1,7 +1,6 @@
 from pathlib import Path
 from io import BytesIO
 import networkx as nx
-from sentence_transformers import SentenceTransformer
 import pickle
 import json
 import ollama
@@ -14,6 +13,21 @@ import base64
 import jieba
 import fitz
 from vector_store import VectorStore # 导入 VectorStore 类
+
+_sentence_transformers_import_error = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ModuleNotFoundError as e:
+    SentenceTransformer = None
+    _sentence_transformers_import_error = e
+
+
+def _require_dependency(dep_obj, package_name: str, import_error: Exception):
+    if dep_obj is None:
+        raise ModuleNotFoundError(
+            f"缺少依赖 `{package_name}`。请先执行: pip install {package_name}"
+        ) from import_error
 
 
 class PDFToMarkdownConverter:
@@ -81,6 +95,7 @@ class PDFToMarkdownConverter:
 
 class DocumentProcessor:
     def __init__(self, pdf_model: str = "qwen3-vl:8b"):
+        _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
         self.encoder = SentenceTransformer('shibing624/text2vec-base-chinese')
         self.pdf_converter = PDFToMarkdownConverter(model=pdf_model)
 
@@ -174,6 +189,7 @@ class GraphRAG:
 
         self.processor = DocumentProcessor()
         self.graph = nx.DiGraph()  # 使用有向图
+        _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
         self.embeddings_model = SentenceTransformer('shibing624/text2vec-base-chinese')
         self.node_embeddings = {}
         self.graph_save_path = self.save_dir / "graph_data.pkl" # 图谱保存路径
