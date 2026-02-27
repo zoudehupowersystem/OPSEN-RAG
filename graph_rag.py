@@ -30,6 +30,18 @@ def _require_dependency(dep_obj, package_name: str, import_error: Exception):
         ) from import_error
 
 
+_embedding_model_singleton = None
+
+
+def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chinese'):
+    """获取共享的文本向量模型实例，避免重复加载权重。"""
+    global _embedding_model_singleton
+    _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
+    if _embedding_model_singleton is None:
+        _embedding_model_singleton = SentenceTransformer(model_name)
+    return _embedding_model_singleton
+
+
 class PDFToMarkdownConverter:
     """使用多模态模型将 PDF 转换为 Markdown。"""
 
@@ -94,9 +106,8 @@ class PDFToMarkdownConverter:
         return content
 
 class DocumentProcessor:
-    def __init__(self, pdf_model: str = "qwen3-vl:8b"):
-        _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
-        self.encoder = SentenceTransformer('shibing624/text2vec-base-chinese')
+    def __init__(self, pdf_model: str = "qwen3-vl:8b", encoder=None):
+        self.encoder = encoder or get_shared_embedding_model()
         self.pdf_converter = PDFToMarkdownConverter(model=pdf_model)
 
     def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
@@ -187,10 +198,9 @@ class GraphRAG:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True) # 确保模型保存目录存在
 
-        self.processor = DocumentProcessor()
+        self.embeddings_model = get_shared_embedding_model()
+        self.processor = DocumentProcessor(encoder=self.embeddings_model)
         self.graph = nx.DiGraph()  # 使用有向图
-        _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
-        self.embeddings_model = SentenceTransformer('shibing624/text2vec-base-chinese')
         self.node_embeddings = {}
         self.graph_save_path = self.save_dir / "graph_data.pkl" # 图谱保存路径
         self.chunk_contents = {} # 存储原始文本块
