@@ -608,44 +608,73 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
             print(f"加载模型失败: {e}, 请先处理文档构建模型。")
             raise e #  向上层抛出异常，提示需要先处理文档
 
+    def _keyword_overlap_score(self, query: str, content: str) -> float:
+        """基于关键词覆盖率计算简单重排分数。"""
+        query_terms = set([w.strip() for w in jieba.cut(query) if len(w.strip()) > 1])
+        if not query_terms:
+            return 0.0
 
-    def hybrid_search(self, query: str, top_k_vector: int = 3, top_k_graph: int = 2) -> List[Dict[str, Any]]:
+        content_terms = set([w.strip() for w in jieba.cut(content) if len(w.strip()) > 1])
+        if not content_terms:
+            return 0.0
+
+        overlap = query_terms & content_terms
+        return len(overlap) / max(len(query_terms), 1)
+
+    def _fuse_score(self, vector_score: float, overlap_score: float, graph_bonus: float = 0.0) -> float:
+        """融合向量相似度与关键词匹配分数。"""
+        return 0.72 * vector_score + 0.23 * overlap_score + 0.05 * graph_bonus
+
+
+    def hybrid_search(self, query: str, top_k_vector: int = 8, top_k_graph: int = 4) -> List[Dict[str, Any]]:
         """结合向量检索和图谱结构的混合搜索策略。"""
         query_embedding = self.embeddings_model.encode(query)
 
-        # 1. 向量检索
-        relevant_chunk_ids, distances = self.vector_store.search(query_embedding, top_k=top_k_vector)
-        vector_results = []
+        # 1. 向量检索（先高召回，再重排）
+        candidate_k = max(top_k_vector * 4, 20)
+        relevant_chunk_ids, distances = self.vector_store.search(query_embedding, top_k=candidate_k)
+
+        vector_results_by_chunk = {}
         for chunk_id, distance in zip(relevant_chunk_ids, distances):
             content = self.chunk_contents.get(chunk_id, '')
-            if content:
-                vector_results.append({
-                    'content': content,
-                    'score': 1 - distance / 2, # 欧氏距离转换为相似度分数
-                    'source': 'vector_search',
-                    'chunk_id': chunk_id
-                })
+            if not content:
+                continue
 
-        # 2. 图谱实体扩展和关系发现
+            vector_score = max(0.0, 1 - float(distance) / 2) # 欧氏距离转换为相似度分数
+            overlap_score = self._keyword_overlap_score(query, content)
+            fused = self._fuse_score(vector_score=vector_score, overlap_score=overlap_score)
+
+            old_item = vector_results_by_chunk.get(chunk_id)
+            if old_item is None or fused > old_item['score']:
+                vector_results_by_chunk[chunk_id] = {
+                    'content': content,
+                    'score': fused,
+                    'source': 'vector_search',
+                    'chunk_id': chunk_id,
+                    'vector_score': vector_score,
+                    'overlap_score': overlap_score
+                }
+
+        vector_results = sorted(vector_results_by_chunk.values(), key=lambda x: x['score'], reverse=True)[:top_k_vector]
+
+        # 2. 图谱实体扩展和关系发现（修复 chunk->entity 查找方向）
         graph_results = []
         seen_entities = set()
         for result_item in vector_results: # 基于向量检索结果进行图谱扩展
             chunk_id = result_item['chunk_id']
 
-            # 查找包含此 chunk_id 的实体
-            related_entities = [node for node, neighbor in self.graph.out_edges(chunk_id) if neighbor != chunk_id]
+            # 查找与此 chunk 关联的实体：entity -> chunk，故使用 in_edges
+            related_entities = [entity for entity, _ in self.graph.in_edges(chunk_id) if not entity.startswith('chunk_')]
 
             for entity in related_entities:
                 if entity not in seen_entities:
                     seen_entities.add(entity)
-                    # 获取实体及其关系
-                    entity_info = self._get_entity_and_relations(entity, query_embedding, score_boost=result_item['score']) # 实体分数加入 score_boost
+                    entity_info = self._get_entity_and_relations(entity, query_embedding, score_boost=result_item['score'])
                     graph_results.extend(entity_info)
-
 
         # 3. 结果融合和排序
         combined_results = vector_results + graph_results
-        combined_results = sorted(combined_results, key=lambda x: x['score'], reverse=True)[:(top_k_vector + top_k_graph)] #  混合结果取 top_k
+        combined_results = sorted(combined_results, key=lambda x: x['score'], reverse=True)[:(top_k_vector + top_k_graph)]
 
         return combined_results
 
@@ -686,6 +715,6 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         return entity_results
 
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]: #  search 方法现在调用混合搜索
+    def search(self, query: str, top_k: int = 8) -> List[Dict[str, Any]]: #  search 方法现在调用混合搜索
         """修改 search 方法，默认使用混合搜索策略。"""
-        return self.hybrid_search(query, top_k_vector=top_k, top_k_graph=top_k // 2) #  可以调整 top_k_vector 和 top_k_graph 的比例
+        return self.hybrid_search(query, top_k_vector=top_k, top_k_graph=max(2, top_k // 2)) #  可以调整 top_k_vector 和 top_k_graph 的比例
