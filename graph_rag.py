@@ -428,10 +428,30 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         self.vector_store = VectorStore(embedding_size=768, # 假设 sentence-transformers 模型输出维度是 768
                                         index_path=self.save_dir / "vector_index.faiss") # 指定向量索引保存路径
 
+    def prepare_documents(self):
+        """预处理输入文档：先将 PDF 转换为 Markdown。"""
+        self.processor.convert_pdfs_to_markdown(self.data_dir)
+
+    def models_are_stale(self) -> bool:
+        """判断当前索引/图谱是否已落后于 data 目录中的文档。"""
+        if not self.vector_store.index_path.exists() or not self.graph_save_path.exists():
+            return True
+
+        data_files = list(self.data_dir.glob("*.md")) + list(self.data_dir.glob("*.pdf"))
+        if not data_files:
+            return False
+
+        latest_data_mtime = max(f.stat().st_mtime for f in data_files)
+        latest_model_mtime = min(
+            self.vector_store.index_path.stat().st_mtime,
+            self.graph_save_path.stat().st_mtime,
+        )
+        return latest_data_mtime > latest_model_mtime
+
     def process_documents(self):
         """处理文档，构建向量索引和知识图谱。"""
         all_chunks = []
-        self.processor.convert_pdfs_to_markdown(self.data_dir)
+        self.prepare_documents()
         md_files = list(self.data_dir.glob("*.md"))
         total_files = len(md_files)
 
