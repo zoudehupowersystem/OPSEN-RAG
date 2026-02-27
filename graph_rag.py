@@ -709,17 +709,29 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
             for entity in related_entities:
                 if entity not in seen_entities:
                     seen_entities.add(entity)
-                    entity_info = self._get_entity_and_relations(entity, query_embedding, score_boost=result_item['score'])
+                    entity_info = self._get_entity_and_relations(entity, query, query_embedding, score_boost=result_item['score'])
                     graph_results.extend(entity_info)
 
         # 3. 结果融合和排序
         combined_results = vector_results + graph_results
-        combined_results = sorted(combined_results, key=lambda x: x['score'], reverse=True)[:(top_k_vector + top_k_graph)]
+
+        # 清理空内容 / 非法分数 / 重复内容
+        dedup = {}
+        for item in combined_results:
+            content = str(item.get('content', '')).strip()
+            score = float(item.get('score', 0.0)) if item.get('score', 0.0) is not None else 0.0
+            if not content or not np.isfinite(score):
+                continue
+            old_item = dedup.get(content)
+            if old_item is None or score > old_item['score']:
+                dedup[content] = {**item, 'content': content, 'score': score}
+
+        combined_results = sorted(dedup.values(), key=lambda x: x['score'], reverse=True)[:(top_k_vector + top_k_graph)]
 
         return combined_results
 
 
-    def _get_entity_and_relations(self, entity, query_embedding, score_boost=1.0):
+    def _get_entity_and_relations(self, entity, query: str, query_embedding, score_boost=1.0):
         """获取实体信息及其相关关系，并计算相关性得分，可以根据 score_boost 调整分数。"""
         entity_results = []
 
@@ -730,12 +742,14 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         else:
             entity_score = 0.5 * score_boost # 默认分数
 
-        entity_results.append({
-            'content': f"**实体**: {entity}",
-            'score': entity_score,
-            'source': 'graph_entity',
-            'entity': entity
-        })
+        entity_overlap = self._keyword_overlap_score(query, entity)
+        if entity_overlap > 0:
+            entity_results.append({
+                'content': f"**实体**: {entity}",
+                'score': self._fuse_score(entity_score, entity_overlap),
+                'source': 'graph_entity',
+                'entity': entity
+            })
 
         # 获取实体的关系信息
         for _, neighbor in self.graph.out_edges(entity):
@@ -743,7 +757,8 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
                 edge_data = self.graph.get_edge_data(entity, neighbor)
                 relation = edge_data.get('relation', 'related_to')
                 relation_content = f"**关系**: {entity} --{relation}--> {neighbor}"
-                relation_score = entity_score * 0.8 # 关系的分数可以适当降低
+                relation_overlap = self._keyword_overlap_score(query, relation_content)
+                relation_score = self._fuse_score(entity_score * 0.8, relation_overlap) # 关系的分数可以适当降低
                 entity_results.append({
                     'content': relation_content,
                     'score': relation_score,
