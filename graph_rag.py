@@ -44,25 +44,39 @@ def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chine
 
 
 class PDFToMarkdownConverter:
-    """使用多模态模型将 PDF 转换为 Markdown。"""
+    """使用多模态模型将 PDF 按页转换为 Markdown。"""
 
     def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220):
         self.model = model
         self.page_dpi = page_dpi
 
-    def convert(self, pdf_path: Path, output_dir: Path) -> Path:
-        """将 PDF 文件转换为 Markdown 文件。"""
+    def get_page_count(self, pdf_path: Path) -> int:
+        """获取 PDF 页数。"""
+        doc = fitz.open(pdf_path)
+        try:
+            return doc.page_count
+        finally:
+            doc.close()
+
+    def get_expected_page_files(self, pdf_path: Path, output_dir: Path) -> List[Path]:
+        """获取按页输出的预期 Markdown 文件路径。"""
+        page_count = self.get_page_count(pdf_path)
+        return [output_dir / f"{pdf_path.stem}_{i}.md" for i in range(1, page_count + 1)]
+
+    def convert(self, pdf_path: Path, output_dir: Path) -> List[Path]:
+        """将 PDF 文件按页转换为 Markdown 文件（`*_1.md` ... `*_N.md`）。"""
         output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / f"{pdf_path.stem}.md"
 
         doc = fitz.open(pdf_path)
-        page_markdowns = []
+        output_paths = []
         try:
             for page_index, page in enumerate(doc, 1):
+                output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
                 try:
                     page_image_b64 = self._render_page_to_base64(page)
                     page_markdown = self._recognize_markdown(page_image_b64, page_index)
-                    page_markdowns.append(page_markdown)
+                    output_path.write_text(page_markdown, encoding="utf-8")
+                    output_paths.append(output_path)
                 except Exception as e:
                     raise RuntimeError(
                         f"第 {page_index} 页识别失败（model={self.model}, dpi={self.page_dpi}）: {e}"
@@ -70,9 +84,18 @@ class PDFToMarkdownConverter:
         finally:
             doc.close()
 
-        markdown_text = "\n\n".join(page_markdowns)
-        output_path.write_text(markdown_text, encoding="utf-8")
-        return output_path
+        # 清理旧的整本输出和冗余分页文件
+        legacy_path = output_dir / f"{pdf_path.stem}.md"
+        if legacy_path.exists():
+            legacy_path.unlink()
+
+        stale_page_files = sorted(output_dir.glob(f"{pdf_path.stem}_*.md"))
+        valid_names = {p.name for p in output_paths}
+        for stale_file in stale_page_files:
+            if stale_file.name not in valid_names:
+                stale_file.unlink()
+
+        return output_paths
 
     def _render_page_to_base64(self, page) -> str:
         """渲染页面为图片并编码为 base64。"""
@@ -120,22 +143,25 @@ class DocumentProcessor:
         self.pdf_converter = PDFToMarkdownConverter(model=pdf_model)
 
     def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
-        """将目录内 PDF 转换为 Markdown。"""
+        """将目录内 PDF 按页转换为 Markdown。"""
         converted_files = []
         pdf_files = sorted(data_dir.glob("*.pdf"))
 
         for pdf_file in pdf_files:
-            output_md = data_dir / f"{pdf_file.stem}.md"
-            if output_md.exists() and output_md.stat().st_mtime >= pdf_file.stat().st_mtime:
-                print(f"跳过 PDF 转换（Markdown 已是最新）: {pdf_file.name}")
-                converted_files.append(output_md)
+            expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
+            if expected_page_files and all(
+                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
+                for file in expected_page_files
+            ):
+                print(f"跳过 PDF 转换（分页 Markdown 已是最新）: {pdf_file.name}")
+                converted_files.extend(expected_page_files)
                 continue
 
-            print(f"开始转换 PDF -> Markdown: {pdf_file.name}")
+            print(f"开始转换 PDF -> Markdown(按页): {pdf_file.name}")
             try:
-                converted_path = self.pdf_converter.convert(pdf_file, data_dir)
-                converted_files.append(converted_path)
-                print(f"PDF 转换完成: {converted_path.name}")
+                converted_paths = self.pdf_converter.convert(pdf_file, data_dir)
+                converted_files.extend(converted_paths)
+                print(f"PDF 分页转换完成: {pdf_file.name}, 共 {len(converted_paths)} 页")
             except Exception as e:
                 print(f"PDF 转换失败 {pdf_file.name}: {e}")
                 print(f"错误类型: {type(e).__name__}")
