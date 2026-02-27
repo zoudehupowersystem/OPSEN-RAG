@@ -1,21 +1,243 @@
 from pathlib import Path
+from io import BytesIO
 import networkx as nx
-from sentence_transformers import SentenceTransformer
 import pickle
 import json
 import ollama
 from markdown import markdown
 from bs4 import BeautifulSoup
 import re
+import traceback
+import time
 import numpy as np
 from typing import List, Tuple, Dict, Any
+import base64
 import jieba
-import numpy as np
+import fitz
 from vector_store import VectorStore # 导入 VectorStore 类
 
+_sentence_transformers_import_error = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ModuleNotFoundError as e:
+    SentenceTransformer = None
+    _sentence_transformers_import_error = e
+
+
+def _require_dependency(dep_obj, package_name: str, import_error: Exception):
+    if dep_obj is None:
+        raise ModuleNotFoundError(
+            f"缺少依赖 `{package_name}`。请先执行: pip install {package_name}"
+        ) from import_error
+
+
+_embedding_model_singleton = None
+
+
+def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chinese'):
+    """获取共享的文本向量模型实例，避免重复加载权重。"""
+    global _embedding_model_singleton
+    _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
+    if _embedding_model_singleton is None:
+        _embedding_model_singleton = SentenceTransformer(model_name)
+    return _embedding_model_singleton
+
+
+class PDFToMarkdownConverter:
+    """使用多模态模型将 PDF 按页转换为 Markdown。"""
+
+    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 5, retry_wait_s: float = 2.0, release_vram_each_page: bool = True, num_ctx: int = 16384, max_output_tokens: int = 4096):
+        self.model = model
+        self.page_dpi = page_dpi
+        self.show_llm_interaction = show_llm_interaction
+        self.max_retries = max_retries
+        self.retry_wait_s = retry_wait_s
+        self.release_vram_each_page = release_vram_each_page
+        self.num_ctx = num_ctx
+        self.max_output_tokens = max_output_tokens
+
+    def get_page_count(self, pdf_path: Path) -> int:
+        """获取 PDF 页数。"""
+        doc = fitz.open(pdf_path)
+        try:
+            return doc.page_count
+        finally:
+            doc.close()
+
+    def get_expected_page_files(self, pdf_path: Path, output_dir: Path) -> List[Path]:
+        """获取按页输出的预期 Markdown 文件路径。"""
+        page_count = self.get_page_count(pdf_path)
+        return [output_dir / f"{pdf_path.stem}_{i}.md" for i in range(1, page_count + 1)]
+
+    def convert(self, pdf_path: Path, output_dir: Path) -> List[Path]:
+        """将 PDF 文件按页转换为 Markdown 文件（`*_1.md` ... `*_N.md`）。"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fig_dir = output_dir / "figs"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        doc = fitz.open(pdf_path)
+        output_paths = []
+        figure_paths = []
+        try:
+            total_pages = doc.page_count
+            print(f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页")
+            for page_index, page in enumerate(doc, 1):
+                output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
+                figure_path = fig_dir / f"{pdf_path.stem}_{page_index}.png"
+                try:
+                    print(f"  -> 处理第 {page_index}/{total_pages} 页")
+                    page_image_b64 = self._render_page_to_base64(page, figure_path)
+                    page_markdown = self._recognize_markdown(page_image_b64, page_index, pdf_path.name)
+                    output_path.write_text(page_markdown, encoding="utf-8")
+                    output_paths.append(output_path)
+                    figure_paths.append(figure_path)
+                    print(f"  -> 第 {page_index} 页完成，输出: {output_path.name}，中间图像: figs/{figure_path.name}")
+                except Exception as e:
+                    print(f"  -> 第 {page_index} 页识别失败，将写入失败占位内容: {e}")
+                    failure_md = (
+                        f"## 第 {page_index} 页\n\n"
+                        f"[图示说明：该页识别失败。错误：{e}]"
+                    )
+                    output_path.write_text(failure_md, encoding="utf-8")
+                    output_paths.append(output_path)
+                    figure_paths.append(figure_path)
+        finally:
+            doc.close()
+
+        # 清理旧的整本输出和冗余分页文件
+        legacy_path = output_dir / f"{pdf_path.stem}.md"
+        if legacy_path.exists():
+            legacy_path.unlink()
+
+        stale_page_files = sorted(output_dir.glob(f"{pdf_path.stem}_*.md"))
+        valid_page_names = {p.name for p in output_paths}
+        for stale_file in stale_page_files:
+            if stale_file.name not in valid_page_names:
+                stale_file.unlink()
+
+        stale_fig_files = sorted(fig_dir.glob(f"{pdf_path.stem}_*.png"))
+        valid_fig_names = {p.name for p in figure_paths}
+        for stale_file in stale_fig_files:
+            if stale_file.name not in valid_fig_names:
+                stale_file.unlink()
+
+        print(f"完成 {pdf_path.name} 分页转换，产出 {len(output_paths)} 个 Markdown 文件")
+        return output_paths
+
+    def _render_page_to_base64(self, page, figure_path: Path) -> str:
+        """渲染页面为图片，保存到 figs 目录并编码为 base64。"""
+        scale = self.page_dpi / 72
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        image_bytes = pix.tobytes("png")
+        figure_path.write_bytes(image_bytes)
+        image_buffer = BytesIO(image_bytes)
+        return base64.b64encode(image_buffer.getvalue()).decode("utf-8")
+
+    def _is_retryable_error(self, error: Exception) -> bool:
+        msg = str(error).lower()
+        return ("status code: 503" in msg or "timeout" in msg or "temporarily" in msg or "返回空内容" in msg)
+
+    def _recognize_markdown(self, image_b64: str, page_index: int, pdf_name: str) -> str:
+        """通过多模态模型识别页面内容并输出 Markdown（带重试）。"""
+        prompt = (
+            "你是一个 PDF 到 Markdown 的专业转换助手。"
+            "请将这页 PDF 内容严格转换为 Markdown，要求：\n"
+            "1) 保留标题、列表、表格和段落结构。\n"
+            "2) 所有公式必须识别为 LaTeX。独立一行公式使用 $$...$$ 包裹并单独成行；"
+            "行内公式使用 $...$。\n"
+            "3) 如果页面有图片，请不要输出图片链接，改为在对应位置写简要中文描述，格式为："
+            "[图示说明：...]。\n"
+            "4) 仅输出 Markdown 内容，不要解释，不要添加额外前后缀。"
+        )
+
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                if self.show_llm_interaction:
+                    print(
+                        f"    [LLM请求] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, "
+                        f"模型={self.model}, keep_alive={'0s' if self.release_vram_each_page else '5m'}, num_ctx={self.num_ctx}, num_predict={self.max_output_tokens}, prompt长度={len(prompt)}"
+                    )
+
+                keep_alive = "0s" if self.release_vram_each_page else "5m"
+                response = ollama.chat(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [image_b64],
+                        }
+                    ],
+                    options={
+                        "temperature": 0,
+                        "num_ctx": self.num_ctx,
+                        "num_predict": self.max_output_tokens,
+                    },
+                    keep_alive=keep_alive,
+                )
+
+                content = response.get("message", {}).get("content", "").strip()
+                if self.show_llm_interaction:
+                    preview = content[:200].replace("\n", " ")
+                    print(
+                        f"    [LLM响应] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, "
+                        f"返回长度={len(content)}, 预览={preview}"
+                    )
+                if not content:
+                    raise RuntimeError("LLM返回空内容")
+                return content
+            except Exception as e:
+                last_error = e
+                should_retry = self._is_retryable_error(e) and attempt < self.max_retries
+                print(f"    [LLM异常] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, 错误={e}")
+                if should_retry:
+                    wait_s = self.retry_wait_s * attempt
+                    print(f"    [LLM重试] {wait_s:.1f}s 后重试第 {page_index} 页...")
+                    time.sleep(wait_s)
+                    continue
+                break
+
+        raise RuntimeError(f"LLM识别失败（重试{self.max_retries}次后仍失败，或持续返回空内容）: {last_error}")
+
 class DocumentProcessor:
-    def __init__(self):
-        self.encoder = SentenceTransformer('shibing624/text2vec-base-chinese')
+    def __init__(self, pdf_model: str = "qwen3-vl:8b", encoder=None, release_vram_each_page: bool = True):
+        self.encoder = encoder or get_shared_embedding_model()
+        self.pdf_converter = PDFToMarkdownConverter(model=pdf_model, release_vram_each_page=release_vram_each_page)
+
+    def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
+        """将目录内 PDF 按页转换为 Markdown。"""
+        converted_files = []
+        pdf_files = sorted(data_dir.glob("*.pdf"))
+
+        for pdf_file in pdf_files:
+            expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
+            if expected_page_files and all(
+                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
+                for file in expected_page_files
+            ):
+                print(f"跳过 PDF 转换（分页 Markdown 已是最新）: {pdf_file.name}")
+                converted_files.extend(expected_page_files)
+                continue
+
+            print(f"开始转换 PDF -> Markdown(按页): {pdf_file.name}")
+            try:
+                converted_paths = self.pdf_converter.convert(pdf_file, data_dir)
+                converted_files.extend(converted_paths)
+                print(f"PDF 分页转换完成: {pdf_file.name}, 共 {len(converted_paths)} 页")
+            except Exception as e:
+                print(f"PDF 转换失败 {pdf_file.name}: {e}")
+                print(f"错误类型: {type(e).__name__}")
+                print("详细堆栈信息：")
+                print(traceback.format_exc())
+                print(
+                    "排查建议：1) 确认 Ollama 服务已启动；2) 确认多模态模型已拉取(如 qwen3-vl:8b)；"
+                    "3) 503 常见于模型未就绪/资源不足，请稍后重试。"
+                )
+
+        return converted_files
 
     def process_markdown(self, file_path: str) -> list:
         """处理单个Markdown文件为文本块。"""
@@ -83,9 +305,9 @@ class GraphRAG:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True) # 确保模型保存目录存在
 
-        self.processor = DocumentProcessor()
+        self.embeddings_model = get_shared_embedding_model()
+        self.processor = DocumentProcessor(encoder=self.embeddings_model)
         self.graph = nx.DiGraph()  # 使用有向图
-        self.embeddings_model = SentenceTransformer('shibing624/text2vec-base-chinese')
         self.node_embeddings = {}
         self.graph_save_path = self.save_dir / "graph_data.pkl" # 图谱保存路径
         self.chunk_contents = {} # 存储原始文本块
@@ -323,9 +545,30 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         self.vector_store = VectorStore(embedding_size=768, # 假设 sentence-transformers 模型输出维度是 768
                                         index_path=self.save_dir / "vector_index.faiss") # 指定向量索引保存路径
 
+    def prepare_documents(self):
+        """预处理输入文档：先将 PDF 转换为 Markdown。"""
+        self.processor.convert_pdfs_to_markdown(self.data_dir)
+
+    def models_are_stale(self) -> bool:
+        """判断当前索引/图谱是否已落后于 data 目录中的文档。"""
+        if not self.vector_store.index_path.exists() or not self.graph_save_path.exists():
+            return True
+
+        data_files = list(self.data_dir.glob("*.md")) + list(self.data_dir.glob("*.pdf"))
+        if not data_files:
+            return False
+
+        latest_data_mtime = max(f.stat().st_mtime for f in data_files)
+        latest_model_mtime = min(
+            self.vector_store.index_path.stat().st_mtime,
+            self.graph_save_path.stat().st_mtime,
+        )
+        return latest_data_mtime > latest_model_mtime
+
     def process_documents(self):
         """处理文档，构建向量索引和知识图谱。"""
         all_chunks = []
+        self.prepare_documents()
         md_files = list(self.data_dir.glob("*.md"))
         total_files = len(md_files)
 
