@@ -20,13 +20,13 @@ if __name__ == "__main__":
         graph_rag.load() # 尝试加载模型
         if graph_rag.models_are_stale():
             print("检测到 data 目录文档有更新，将重新构建模型...")
-            graph_rag.process_documents() #  处理文档并构建模型
+            graph_rag.process_documents(show_entity_relations=False) #  增量重建时不打印实体-关系
         else:
             print("模型已从本地加载 (包括向量索引和图谱).")
             print(f"图谱信息：{graph_rag.graph.number_of_nodes()} 节点, {graph_rag.graph.number_of_edges()} 边")
     except FileNotFoundError: #  捕获 FileNotFoundError 异常
         print("未找到已保存的模型，开始处理文档并构建模型...")
-        graph_rag.process_documents() #  处理文档并构建模型
+        graph_rag.process_documents(show_entity_relations=True) #  首次构建时打印实体-关系
 
 
     while True:  # 循环接收用户查询

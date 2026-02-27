@@ -371,7 +371,7 @@ class GraphRAG:
             print(f"实体关系抽取过程出错: {str(e)}")
             return [], []
 
-    def build_graph(self, all_chunks, force_rebuild=False):
+    def build_graph(self, all_chunks, force_rebuild=False, show_entity_relations=False):
         """构建知识图谱，增加错误处理和进度显示。"""
         if not force_rebuild and self.graph_save_path.exists():
             try:
@@ -397,6 +397,13 @@ class GraphRAG:
 
             try:
                 entities, relations = self.extract_entities_and_relations(content)
+
+                if show_entity_relations:
+                    if entities:
+                        print(f"[实体抽取] {chunk_id}: {', '.join(entities)}")
+                    if relations:
+                        rel_text = "；".join([f"({subj} -{pred}-> {obj})" for subj, pred, obj in relations])
+                        print(f"[关系抽取] {chunk_id}: {rel_text}")
 
                 # 添加实体节点
                 for entity in entities:
@@ -568,7 +575,7 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         )
         return latest_data_mtime > latest_model_mtime
 
-    def process_documents(self):
+    def process_documents(self, show_entity_relations: bool = False):
         """处理文档，构建向量索引和知识图谱。"""
         all_chunks = []
         self.prepare_documents()
@@ -598,7 +605,7 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         print("向量索引构建完成并保存。")
 
         # 构建知识图谱
-        self.build_graph(all_chunks=all_chunks, force_rebuild=True) # 构建知识图谱, 传入 all_chunks
+        self.build_graph(all_chunks=all_chunks, force_rebuild=True, show_entity_relations=show_entity_relations) # 构建知识图谱, 传入 all_chunks
 
 
     def load(self):
