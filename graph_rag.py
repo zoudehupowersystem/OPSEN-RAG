@@ -469,17 +469,20 @@ class GraphRAG:
         return results
 
     def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 800) -> str:
-        """改进的答案生成。"""
+        """改进的答案生成：优先引用检索内容，减少自由发挥。"""
         context_text = "\n".join([
-            f"- {item['content']}" for item in context
+            f"[证据{i+1}] {item['content']}" for i, item in enumerate(context)
         ])
 
         prompt = f"""
-        基于以下知识库信息回答问题。要求：
-        1. 只回答与电力系统和电力电子技术相关的问题
-        2. 综合运用知识库信息和专业知识
-        3. 保持专业性和逻辑性
-        4. 分点说明，简明扼要
+        你是电力系统问答助手。请严格基于“知识库信息”回答，优先引用原文证据，减少自行发挥。
+
+        回答要求：
+        1. 只回答与电力系统和电力电子技术相关的问题。
+        2. 回答时先给“证据引用”，再给结论。
+        3. 每个关键结论后都要附带证据编号，如 [证据1]、[证据3]。
+        4. 若检索内容不足以支撑结论，明确写“根据当前检索内容无法确定”。
+        5. 不要编造未在证据中出现的事实。
 
         知识库信息：
         {context_text}
@@ -625,6 +628,41 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         """融合向量相似度与关键词匹配分数。"""
         return 0.72 * vector_score + 0.23 * overlap_score + 0.05 * graph_bonus
 
+    def _neighbor_chunk_ids(self, chunk_id: str, window: int = 1) -> List[str]:
+        """获取 chunk 前后窗口范围内的 chunk_id（含自身）。"""
+        if not chunk_id.startswith("chunk_"):
+            return [chunk_id]
+
+        try:
+            idx = int(chunk_id.split("_")[1])
+        except Exception:
+            return [chunk_id]
+
+        ids = []
+        for i in range(idx - window, idx + window + 1):
+            if i < 0:
+                continue
+            cand = f"chunk_{i}"
+            if cand in self.chunk_contents:
+                ids.append(cand)
+
+        return ids or [chunk_id]
+
+    def _expanded_chunk_content(self, chunk_id: str, window: int = 1) -> str:
+        """返回包含前后段落的扩展文本。"""
+        ids = self._neighbor_chunk_ids(chunk_id, window=window)
+        sections = []
+
+        chunk_idx = int(chunk_id.split("_")[1]) if chunk_id.startswith("chunk_") else 0
+        for cid in ids:
+            tag = "当前段"
+            if cid != chunk_id and cid.startswith("chunk_"):
+                neighbor_idx = int(cid.split("_")[1])
+                tag = "前文段" if neighbor_idx < chunk_idx else "后文段"
+            sections.append(f"【{tag} {cid}】{self.chunk_contents.get(cid, '')}")
+
+        return "\n".join(sections)
+
 
     def hybrid_search(self, query: str, top_k_vector: int = 8, top_k_graph: int = 4) -> List[Dict[str, Any]]:
         """结合向量检索和图谱结构的混合搜索策略。"""
@@ -636,18 +674,20 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
 
         vector_results_by_chunk = {}
         for chunk_id, distance in zip(relevant_chunk_ids, distances):
-            content = self.chunk_contents.get(chunk_id, '')
-            if not content:
+            base_content = self.chunk_contents.get(chunk_id, '')
+            if not base_content:
                 continue
 
+            expanded_content = self._expanded_chunk_content(chunk_id, window=1)
+
             vector_score = max(0.0, 1 - float(distance) / 2) # 欧氏距离转换为相似度分数
-            overlap_score = self._keyword_overlap_score(query, content)
+            overlap_score = self._keyword_overlap_score(query, expanded_content)
             fused = self._fuse_score(vector_score=vector_score, overlap_score=overlap_score)
 
             old_item = vector_results_by_chunk.get(chunk_id)
             if old_item is None or fused > old_item['score']:
                 vector_results_by_chunk[chunk_id] = {
-                    'content': content,
+                    'content': expanded_content,
                     'score': fused,
                     'source': 'vector_search',
                     'chunk_id': chunk_id,
