@@ -47,13 +47,15 @@ def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chine
 class PDFToMarkdownConverter:
     """使用多模态模型将 PDF 按页转换为 Markdown。"""
 
-    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 3, retry_wait_s: float = 2.0, release_vram_each_page: bool = True):
+    def __init__(self, model: str = "qwen3-vl:8b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 5, retry_wait_s: float = 2.0, release_vram_each_page: bool = True, num_ctx: int = 16384, max_output_tokens: int = 4096):
         self.model = model
         self.page_dpi = page_dpi
         self.show_llm_interaction = show_llm_interaction
         self.max_retries = max_retries
         self.retry_wait_s = retry_wait_s
         self.release_vram_each_page = release_vram_each_page
+        self.num_ctx = num_ctx
+        self.max_output_tokens = max_output_tokens
 
     def get_page_count(self, pdf_path: Path) -> int:
         """获取 PDF 页数。"""
@@ -135,7 +137,7 @@ class PDFToMarkdownConverter:
 
     def _is_retryable_error(self, error: Exception) -> bool:
         msg = str(error).lower()
-        return "status code: 503" in msg or "timeout" in msg or "temporarily" in msg
+        return ("status code: 503" in msg or "timeout" in msg or "temporarily" in msg or "返回空内容" in msg)
 
     def _recognize_markdown(self, image_b64: str, page_index: int, pdf_name: str) -> str:
         """通过多模态模型识别页面内容并输出 Markdown（带重试）。"""
@@ -156,7 +158,7 @@ class PDFToMarkdownConverter:
                 if self.show_llm_interaction:
                     print(
                         f"    [LLM请求] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, "
-                        f"模型={self.model}, keep_alive={'0s' if self.release_vram_each_page else '5m'}, prompt长度={len(prompt)}"
+                        f"模型={self.model}, keep_alive={'0s' if self.release_vram_each_page else '5m'}, num_ctx={self.num_ctx}, num_predict={self.max_output_tokens}, prompt长度={len(prompt)}"
                     )
 
                 keep_alive = "0s" if self.release_vram_each_page else "5m"
@@ -171,6 +173,8 @@ class PDFToMarkdownConverter:
                     ],
                     options={
                         "temperature": 0,
+                        "num_ctx": self.num_ctx,
+                        "num_predict": self.max_output_tokens,
                     },
                     keep_alive=keep_alive,
                 )
@@ -183,7 +187,7 @@ class PDFToMarkdownConverter:
                         f"返回长度={len(content)}, 预览={preview}"
                     )
                 if not content:
-                    return f"## 第 {page_index} 页\n\n[图示说明：该页未识别到可用文本内容。]"
+                    raise RuntimeError("LLM返回空内容")
                 return content
             except Exception as e:
                 last_error = e
@@ -196,7 +200,7 @@ class PDFToMarkdownConverter:
                     continue
                 break
 
-        raise RuntimeError(f"LLM识别失败（重试{self.max_retries}次后仍失败）: {last_error}")
+        raise RuntimeError(f"LLM识别失败（重试{self.max_retries}次后仍失败，或持续返回空内容）: {last_error}")
 
 class DocumentProcessor:
     def __init__(self, pdf_model: str = "qwen3-vl:8b", encoder=None, release_vram_each_page: bool = True):
