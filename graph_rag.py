@@ -7,6 +7,7 @@ import ollama
 from markdown import markdown
 from bs4 import BeautifulSoup
 import re
+import traceback
 import numpy as np
 from typing import List, Tuple, Dict, Any
 import base64
@@ -56,10 +57,18 @@ class PDFToMarkdownConverter:
 
         doc = fitz.open(pdf_path)
         page_markdowns = []
-        for page_index, page in enumerate(doc, 1):
-            page_image_b64 = self._render_page_to_base64(page)
-            page_markdown = self._recognize_markdown(page_image_b64, page_index)
-            page_markdowns.append(page_markdown)
+        try:
+            for page_index, page in enumerate(doc, 1):
+                try:
+                    page_image_b64 = self._render_page_to_base64(page)
+                    page_markdown = self._recognize_markdown(page_image_b64, page_index)
+                    page_markdowns.append(page_markdown)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"第 {page_index} 页识别失败（model={self.model}, dpi={self.page_dpi}）: {e}"
+                    ) from e
+        finally:
+            doc.close()
 
         markdown_text = "\n\n".join(page_markdowns)
         output_path.write_text(markdown_text, encoding="utf-8")
@@ -129,6 +138,13 @@ class DocumentProcessor:
                 print(f"PDF 转换完成: {converted_path.name}")
             except Exception as e:
                 print(f"PDF 转换失败 {pdf_file.name}: {e}")
+                print(f"错误类型: {type(e).__name__}")
+                print("详细堆栈信息：")
+                print(traceback.format_exc())
+                print(
+                    "排查建议：1) 确认 Ollama 服务已启动；2) 确认多模态模型已拉取(如 qwen3-vl:8b)；"
+                    "3) 503 常见于模型未就绪/资源不足，请稍后重试。"
+                )
 
         return converted_files
 
