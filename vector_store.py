@@ -34,11 +34,23 @@ class VectorStore:
 
     def search(self, query_vector, top_k=3):
         """使用 FAISS 索引进行相似度搜索。"""
+        if self.is_empty():
+            return [], np.array([], dtype='float32')
+
+        top_k = min(top_k, self.index.ntotal)
         query_vector = query_vector / np.linalg.norm(query_vector) # 归一化查询向量
         query_vector = query_vector.astype('float32').reshape(1, -1)
         distances, faiss_ids = self.index.search(query_vector, top_k)
-        chunk_ids = [self.id_to_chunk_id[idx] for idx in faiss_ids[0]] # 根据 FAISS 返回的索引 ID 找到 chunk_id
-        return chunk_ids, distances[0] # 返回 chunk_id 列表和对应的距离
+
+        chunk_ids = []
+        valid_distances = []
+        for idx, distance in zip(faiss_ids[0], distances[0]):
+            if idx < 0 or idx >= len(self.id_to_chunk_id):
+                continue
+            chunk_ids.append(self.id_to_chunk_id[idx])
+            valid_distances.append(float(distance))
+
+        return chunk_ids, np.array(valid_distances, dtype='float32') # 返回 chunk_id 列表和对应的距离
 
 
     def save_index(self, save_path):

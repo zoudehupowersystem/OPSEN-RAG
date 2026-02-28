@@ -1,21 +1,244 @@
+
 from pathlib import Path
+from io import BytesIO
 import networkx as nx
-from sentence_transformers import SentenceTransformer
 import pickle
 import json
 import ollama
 from markdown import markdown
 from bs4 import BeautifulSoup
 import re
+import traceback
+import time
 import numpy as np
 from typing import List, Tuple, Dict, Any
+import base64
 import jieba
-import numpy as np
+import fitz
 from vector_store import VectorStore # 导入 VectorStore 类
 
+_sentence_transformers_import_error = None
+
+try:
+    from sentence_transformers import SentenceTransformer
+except ModuleNotFoundError as e:
+    SentenceTransformer = None
+    _sentence_transformers_import_error = e
+
+
+def _require_dependency(dep_obj, package_name: str, import_error: Exception):
+    if dep_obj is None:
+        raise ModuleNotFoundError(
+            f"缺少依赖 `{package_name}`。请先执行: pip install {package_name}"
+        ) from import_error
+
+
+_embedding_model_singleton = None
+
+
+def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chinese'):
+    """获取共享的文本向量模型实例，避免重复加载权重。"""
+    global _embedding_model_singleton
+    _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
+    if _embedding_model_singleton is None:
+        _embedding_model_singleton = SentenceTransformer(model_name)
+    return _embedding_model_singleton
+
+
+class PDFToMarkdownConverter:
+    """使用多模态模型将 PDF 按页转换为 Markdown。"""
+
+    def __init__(self, model: str = "qwen3-vl:30b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 5, retry_wait_s: float = 2.0, release_vram_each_page: bool = True, num_ctx: int = 16384, max_output_tokens: int = 4096):
+        self.model = model
+        self.page_dpi = page_dpi
+        self.show_llm_interaction = show_llm_interaction
+        self.max_retries = max_retries
+        self.retry_wait_s = retry_wait_s
+        self.release_vram_each_page = release_vram_each_page
+        self.num_ctx = num_ctx
+        self.max_output_tokens = max_output_tokens
+
+    def get_page_count(self, pdf_path: Path) -> int:
+        """获取 PDF 页数。"""
+        doc = fitz.open(pdf_path)
+        try:
+            return doc.page_count
+        finally:
+            doc.close()
+
+    def get_expected_page_files(self, pdf_path: Path, output_dir: Path) -> List[Path]:
+        """获取按页输出的预期 Markdown 文件路径。"""
+        page_count = self.get_page_count(pdf_path)
+        return [output_dir / f"{pdf_path.stem}_{i}.md" for i in range(1, page_count + 1)]
+
+    def convert(self, pdf_path: Path, output_dir: Path) -> List[Path]:
+        """将 PDF 文件按页转换为 Markdown 文件（`*_1.md` ... `*_N.md`）。"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fig_dir = output_dir / "figs"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+
+        doc = fitz.open(pdf_path)
+        output_paths = []
+        figure_paths = []
+        try:
+            total_pages = doc.page_count
+            print(f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页")
+            for page_index, page in enumerate(doc, 1):
+                output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
+                figure_path = fig_dir / f"{pdf_path.stem}_{page_index}.png"
+                try:
+                    print(f"  -> 处理第 {page_index}/{total_pages} 页")
+                    page_image_b64 = self._render_page_to_base64(page, figure_path)
+                    page_markdown = self._recognize_markdown(page_image_b64, page_index, pdf_path.name)
+                    output_path.write_text(page_markdown, encoding="utf-8")
+                    output_paths.append(output_path)
+                    figure_paths.append(figure_path)
+                    print(f"  -> 第 {page_index} 页完成，输出: {output_path.name}，中间图像: figs/{figure_path.name}")
+                except Exception as e:
+                    print(f"  -> 第 {page_index} 页识别失败，将写入失败占位内容: {e}")
+                    failure_md = (
+                        f"## 第 {page_index} 页\n\n"
+                        f"[图示说明：该页识别失败。错误：{e}]"
+                    )
+                    output_path.write_text(failure_md, encoding="utf-8")
+                    output_paths.append(output_path)
+                    figure_paths.append(figure_path)
+        finally:
+            doc.close()
+
+        # 清理旧的整本输出和冗余分页文件
+        legacy_path = output_dir / f"{pdf_path.stem}.md"
+        if legacy_path.exists():
+            legacy_path.unlink()
+
+        stale_page_files = sorted(output_dir.glob(f"{pdf_path.stem}_*.md"))
+        valid_page_names = {p.name for p in output_paths}
+        for stale_file in stale_page_files:
+            if stale_file.name not in valid_page_names:
+                stale_file.unlink()
+
+        stale_fig_files = sorted(fig_dir.glob(f"{pdf_path.stem}_*.png"))
+        valid_fig_names = {p.name for p in figure_paths}
+        for stale_file in stale_fig_files:
+            if stale_file.name not in valid_fig_names:
+                stale_file.unlink()
+
+        print(f"完成 {pdf_path.name} 分页转换，产出 {len(output_paths)} 个 Markdown 文件")
+        return output_paths
+
+    def _render_page_to_base64(self, page, figure_path: Path) -> str:
+        """渲染页面为图片，保存到 figs 目录并编码为 base64。"""
+        scale = self.page_dpi / 72
+        matrix = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        image_bytes = pix.tobytes("png")
+        figure_path.write_bytes(image_bytes)
+        image_buffer = BytesIO(image_bytes)
+        return base64.b64encode(image_buffer.getvalue()).decode("utf-8")
+
+    def _is_retryable_error(self, error: Exception) -> bool:
+        msg = str(error).lower()
+        return ("status code: 503" in msg or "timeout" in msg or "temporarily" in msg or "返回空内容" in msg)
+
+    def _recognize_markdown(self, image_b64: str, page_index: int, pdf_name: str) -> str:
+        """通过多模态模型识别页面内容并输出 Markdown（带重试）。"""
+        prompt = (
+            "你是一个 PDF 到 Markdown 的专业转换助手。"
+            "请将这页 PDF 内容严格转换为 Markdown，要求：\n"
+            "1) 保留标题、列表、表格和段落结构。\n"
+            "2) 所有公式必须识别为 LaTeX。独立一行公式使用 $$...$$ 包裹并单独成行；"
+            "行内公式使用 $...$。\n"
+            "3) 如果页面有图片，请不要输出图片链接，改为在对应位置写简要中文描述，格式为："
+            "[图示说明：...]。\n"
+            "4) 仅输出 Markdown 内容，不要解释，不要添加额外前后缀。"
+        )
+
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                if self.show_llm_interaction:
+                    print(
+                        f"    [LLM请求] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, "
+                        f"模型={self.model}, keep_alive={'0s' if self.release_vram_each_page else '5m'}, num_ctx={self.num_ctx}, num_predict={self.max_output_tokens}, prompt长度={len(prompt)}"
+                    )
+
+                keep_alive = "0s" if self.release_vram_each_page else "5m"
+                response = ollama.chat(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": prompt,
+                            "images": [image_b64],
+                        }
+                    ],
+                    options={
+                        "temperature": 0,
+                        "num_ctx": self.num_ctx,
+                        "num_predict": self.max_output_tokens,
+                    },
+                    keep_alive=keep_alive,
+                )
+
+                content = response.get("message", {}).get("content", "").strip()
+                if self.show_llm_interaction:
+                    preview = content[:200].replace("\n", " ")
+                    print(
+                        f"    [LLM响应] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, "
+                        f"返回长度={len(content)}, 预览={preview}"
+                    )
+                if not content:
+                    raise RuntimeError("LLM返回空内容")
+                return content
+            except Exception as e:
+                last_error = e
+                should_retry = self._is_retryable_error(e) and attempt < self.max_retries
+                print(f"    [LLM异常] 文件={pdf_name}, 页={page_index}, 尝试={attempt}/{self.max_retries}, 错误={e}")
+                if should_retry:
+                    wait_s = self.retry_wait_s * attempt
+                    print(f"    [LLM重试] {wait_s:.1f}s 后重试第 {page_index} 页...")
+                    time.sleep(wait_s)
+                    continue
+                break
+
+        raise RuntimeError(f"LLM识别失败（重试{self.max_retries}次后仍失败，或持续返回空内容）: {last_error}")
+
 class DocumentProcessor:
-    def __init__(self):
-        self.encoder = SentenceTransformer('shibing624/text2vec-base-chinese')
+    def __init__(self, pdf_model: str = "qwen3-vl:30b", encoder=None, release_vram_each_page: bool = True):
+        self.encoder = encoder or get_shared_embedding_model()
+        self.pdf_converter = PDFToMarkdownConverter(model=pdf_model, release_vram_each_page=release_vram_each_page)
+
+    def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
+        """将目录内 PDF 按页转换为 Markdown。"""
+        converted_files = []
+        pdf_files = sorted(data_dir.glob("*.pdf"))
+
+        for pdf_file in pdf_files:
+            expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
+            if expected_page_files and all(
+                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
+                for file in expected_page_files
+            ):
+                print(f"跳过 PDF 转换（分页 Markdown 已是最新）: {pdf_file.name}")
+                converted_files.extend(expected_page_files)
+                continue
+
+            print(f"开始转换 PDF -> Markdown(按页): {pdf_file.name}")
+            try:
+                converted_paths = self.pdf_converter.convert(pdf_file, data_dir)
+                converted_files.extend(converted_paths)
+                print(f"PDF 分页转换完成: {pdf_file.name}, 共 {len(converted_paths)} 页")
+            except Exception as e:
+                print(f"PDF 转换失败 {pdf_file.name}: {e}")
+                print(f"错误类型: {type(e).__name__}")
+                print("详细堆栈信息：")
+                print(traceback.format_exc())
+                print(
+                    "排查建议：1) 确认 Ollama 服务已启动；2) 确认多模态模型已拉取(如 qwen3-vl:30b)；"
+                    "3) 503 常见于模型未就绪/资源不足，请稍后重试。"
+                )
+
+        return converted_files
 
     def process_markdown(self, file_path: str) -> list:
         """处理单个Markdown文件为文本块。"""
@@ -83,9 +306,9 @@ class GraphRAG:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True) # 确保模型保存目录存在
 
-        self.processor = DocumentProcessor()
+        self.embeddings_model = get_shared_embedding_model()
+        self.processor = DocumentProcessor(encoder=self.embeddings_model)
         self.graph = nx.DiGraph()  # 使用有向图
-        self.embeddings_model = SentenceTransformer('shibing624/text2vec-base-chinese')
         self.node_embeddings = {}
         self.graph_save_path = self.save_dir / "graph_data.pkl" # 图谱保存路径
         self.chunk_contents = {} # 存储原始文本块
@@ -106,7 +329,7 @@ class GraphRAG:
 
         try:
             response = ollama.generate(
-                model='deepseek-r1:7b',
+                model='qwen3-vl:30b',
                 prompt=prompt,
                 options={
                     "temperature": 0.0,
@@ -149,7 +372,7 @@ class GraphRAG:
             print(f"实体关系抽取过程出错: {str(e)}")
             return [], []
 
-    def build_graph(self, all_chunks, force_rebuild=False):
+    def build_graph(self, all_chunks, force_rebuild=False, show_entity_relations=False):
         """构建知识图谱，增加错误处理和进度显示。"""
         if not force_rebuild and self.graph_save_path.exists():
             try:
@@ -175,6 +398,13 @@ class GraphRAG:
 
             try:
                 entities, relations = self.extract_entities_and_relations(content)
+
+                if show_entity_relations:
+                    if entities:
+                        print(f"[实体抽取] {chunk_id}: {', '.join(entities)}")
+                    if relations:
+                        rel_text = "；".join([f"({subj} -{pred}-> {obj})" for subj, pred, obj in relations])
+                        print(f"[关系抽取] {chunk_id}: {rel_text}")
 
                 # 添加实体节点
                 for entity in entities:
@@ -247,17 +477,20 @@ class GraphRAG:
         return results
 
     def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 800) -> str:
-        """改进的答案生成。"""
+        """改进的答案生成：优先引用检索内容，减少自由发挥。"""
         context_text = "\n".join([
-            f"- {item['content']}" for item in context
+            f"[证据{i+1}] {item['content']}" for i, item in enumerate(context)
         ])
 
         prompt = f"""
-        基于以下知识库信息回答问题。要求：
-        1. 只回答与电力系统和电力电子技术相关的问题
-        2. 综合运用知识库信息和专业知识
-        3. 保持专业性和逻辑性
-        4. 分点说明，简明扼要
+        你是电力系统问答助手。请严格基于“知识库信息”回答，优先引用原文证据，减少自行发挥。
+
+        回答要求：
+        1. 只回答与电力系统和电力电子技术相关的问题。
+        2. 回答时先给“证据引用”，再给结论。
+        3. 每个关键结论后都要附带证据编号，如 [证据1]、[证据3]。
+        4. 若检索内容不足以支撑结论，明确写“根据当前检索内容无法确定”。
+        5. 不要编造未在证据中出现的事实。
 
         知识库信息：
         {context_text}
@@ -267,7 +500,7 @@ class GraphRAG:
 
         try:
             response = ollama.generate(
-                model="deepseek-r1:7b",
+                model="qwen3-vl:30b",
                 prompt=prompt,
                 options={
                     "temperature": 0.0,
@@ -323,9 +556,30 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         self.vector_store = VectorStore(embedding_size=768, # 假设 sentence-transformers 模型输出维度是 768
                                         index_path=self.save_dir / "vector_index.faiss") # 指定向量索引保存路径
 
-    def process_documents(self):
+    def prepare_documents(self):
+        """预处理输入文档：先将 PDF 转换为 Markdown。"""
+        self.processor.convert_pdfs_to_markdown(self.data_dir)
+
+    def models_are_stale(self) -> bool:
+        """判断当前索引/图谱是否已落后于 data 目录中的文档。"""
+        if not self.vector_store.index_path.exists() or not self.graph_save_path.exists():
+            return True
+
+        data_files = list(self.data_dir.glob("*.md")) + list(self.data_dir.glob("*.pdf"))
+        if not data_files:
+            return False
+
+        latest_data_mtime = max(f.stat().st_mtime for f in data_files)
+        latest_model_mtime = min(
+            self.vector_store.index_path.stat().st_mtime,
+            self.graph_save_path.stat().st_mtime,
+        )
+        return latest_data_mtime > latest_model_mtime
+
+    def process_documents(self, show_entity_relations: bool = False):
         """处理文档，构建向量索引和知识图谱。"""
         all_chunks = []
+        self.prepare_documents()
         md_files = list(self.data_dir.glob("*.md"))
         total_files = len(md_files)
 
@@ -352,7 +606,7 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         print("向量索引构建完成并保存。")
 
         # 构建知识图谱
-        self.build_graph(all_chunks=all_chunks, force_rebuild=True) # 构建知识图谱, 传入 all_chunks
+        self.build_graph(all_chunks=all_chunks, force_rebuild=True, show_entity_relations=show_entity_relations) # 构建知识图谱, 传入 all_chunks
 
 
     def load(self):
@@ -365,49 +619,127 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
             print(f"加载模型失败: {e}, 请先处理文档构建模型。")
             raise e #  向上层抛出异常，提示需要先处理文档
 
+    def _keyword_overlap_score(self, query: str, content: str) -> float:
+        """基于关键词覆盖率计算简单重排分数。"""
+        query_terms = set([w.strip() for w in jieba.cut(query) if len(w.strip()) > 1])
+        if not query_terms:
+            return 0.0
 
-    def hybrid_search(self, query: str, top_k_vector: int = 3, top_k_graph: int = 2) -> List[Dict[str, Any]]:
+        content_terms = set([w.strip() for w in jieba.cut(content) if len(w.strip()) > 1])
+        if not content_terms:
+            return 0.0
+
+        overlap = query_terms & content_terms
+        return len(overlap) / max(len(query_terms), 1)
+
+    def _fuse_score(self, vector_score: float, overlap_score: float, graph_bonus: float = 0.0) -> float:
+        """融合向量相似度与关键词匹配分数。"""
+        return 0.72 * vector_score + 0.23 * overlap_score + 0.05 * graph_bonus
+
+    def _neighbor_chunk_ids(self, chunk_id: str, window: int = 1) -> List[str]:
+        """获取 chunk 前后窗口范围内的 chunk_id（含自身）。"""
+        if not chunk_id.startswith("chunk_"):
+            return [chunk_id]
+
+        try:
+            idx = int(chunk_id.split("_")[1])
+        except Exception:
+            return [chunk_id]
+
+        ids = []
+        for i in range(idx - window, idx + window + 1):
+            if i < 0:
+                continue
+            cand = f"chunk_{i}"
+            if cand in self.chunk_contents:
+                ids.append(cand)
+
+        return ids or [chunk_id]
+
+    def _expanded_chunk_content(self, chunk_id: str, window: int = 1) -> str:
+        """返回包含前后段落的扩展文本。"""
+        ids = self._neighbor_chunk_ids(chunk_id, window=window)
+        sections = []
+
+        chunk_idx = int(chunk_id.split("_")[1]) if chunk_id.startswith("chunk_") else 0
+        for cid in ids:
+            tag = "当前段"
+            if cid != chunk_id and cid.startswith("chunk_"):
+                neighbor_idx = int(cid.split("_")[1])
+                tag = "前文段" if neighbor_idx < chunk_idx else "后文段"
+            sections.append(f"【{tag} {cid}】{self.chunk_contents.get(cid, '')}")
+
+        return "\n".join(sections)
+
+
+    def hybrid_search(self, query: str, top_k_vector: int = 8, top_k_graph: int = 4) -> List[Dict[str, Any]]:
         """结合向量检索和图谱结构的混合搜索策略。"""
         query_embedding = self.embeddings_model.encode(query)
 
-        # 1. 向量检索
-        relevant_chunk_ids, distances = self.vector_store.search(query_embedding, top_k=top_k_vector)
-        vector_results = []
-        for chunk_id, distance in zip(relevant_chunk_ids, distances):
-            content = self.chunk_contents.get(chunk_id, '')
-            if content:
-                vector_results.append({
-                    'content': content,
-                    'score': 1 - distance / 2, # 欧氏距离转换为相似度分数
-                    'source': 'vector_search',
-                    'chunk_id': chunk_id
-                })
+        # 1. 向量检索（先高召回，再重排）
+        candidate_k = max(top_k_vector * 4, 20)
+        relevant_chunk_ids, distances = self.vector_store.search(query_embedding, top_k=candidate_k)
 
-        # 2. 图谱实体扩展和关系发现
+        vector_results_by_chunk = {}
+        for chunk_id, distance in zip(relevant_chunk_ids, distances):
+            base_content = self.chunk_contents.get(chunk_id, '')
+            if not base_content:
+                continue
+
+            expanded_content = self._expanded_chunk_content(chunk_id, window=1)
+
+            vector_score = max(0.0, 1 - float(distance) / 2) # 欧氏距离转换为相似度分数
+            overlap_score = self._keyword_overlap_score(query, expanded_content)
+            fused = self._fuse_score(vector_score=vector_score, overlap_score=overlap_score)
+
+            old_item = vector_results_by_chunk.get(chunk_id)
+            if old_item is None or fused > old_item['score']:
+                vector_results_by_chunk[chunk_id] = {
+                    'content': expanded_content,
+                    'score': fused,
+                    'source': 'vector_search',
+                    'chunk_id': chunk_id,
+                    'vector_score': vector_score,
+                    'overlap_score': overlap_score
+                }
+
+        vector_results = sorted(vector_results_by_chunk.values(), key=lambda x: x['score'], reverse=True)[:top_k_vector]
+
+        # 2. 图谱实体扩展和关系发现（修复 chunk->entity 查找方向）
         graph_results = []
         seen_entities = set()
         for result_item in vector_results: # 基于向量检索结果进行图谱扩展
             chunk_id = result_item['chunk_id']
 
-            # 查找包含此 chunk_id 的实体
-            related_entities = [node for node, neighbor in self.graph.out_edges(chunk_id) if neighbor != chunk_id]
+            # 查找与此 chunk 关联的实体：entity -> chunk，故使用 in_edges
+            related_entities = [entity for entity, _ in self.graph.in_edges(chunk_id) if not entity.startswith('chunk_')]
 
             for entity in related_entities:
                 if entity not in seen_entities:
                     seen_entities.add(entity)
-                    # 获取实体及其关系
-                    entity_info = self._get_entity_and_relations(entity, query_embedding, score_boost=result_item['score']) # 实体分数加入 score_boost
+                    entity_info = self._get_entity_and_relations(entity, query, query_embedding, score_boost=result_item['score'])
                     graph_results.extend(entity_info)
-
 
         # 3. 结果融合和排序
         combined_results = vector_results + graph_results
-        combined_results = sorted(combined_results, key=lambda x: x['score'], reverse=True)[:(top_k_vector + top_k_graph)] #  混合结果取 top_k
+
+        # 清理空内容 / 非法分数 / 重复内容
+        dedup = {}
+        for item in combined_results:
+            content = str(item.get('content', '')).strip()
+            score = float(item.get('score', 0.0)) if item.get('score', 0.0) is not None else 0.0
+            if not content or not np.isfinite(score):
+                continue
+            old_item = dedup.get(content)
+            if old_item is None or score > old_item['score']:
+                dedup[content] = {**item, 'content': content, 'score': score}
+
+        combined_results = sorted(dedup.values(), key=lambda x: x['score'], reverse=True)[:(top_k_vector + top_k_graph)]
 
         return combined_results
 
 
-    def _get_entity_and_relations(self, entity, query_embedding, score_boost=1.0):
+    def _get_entity_and_relations(self, entity, query: str, query_embedding, score_boost=1.0):
         """获取实体信息及其相关关系，并计算相关性得分，可以根据 score_boost 调整分数。"""
         entity_results = []
 
@@ -418,12 +750,14 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         else:
             entity_score = 0.5 * score_boost # 默认分数
 
-        entity_results.append({
-            'content': f"**实体**: {entity}",
-            'score': entity_score,
-            'source': 'graph_entity',
-            'entity': entity
-        })
+        entity_overlap = self._keyword_overlap_score(query, entity)
+        if entity_overlap > 0:
+            entity_results.append({
+                'content': f"**实体**: {entity}",
+                'score': self._fuse_score(entity_score, entity_overlap),
+                'source': 'graph_entity',
+                'entity': entity
+            })
 
         # 获取实体的关系信息
         for _, neighbor in self.graph.out_edges(entity):
@@ -431,7 +765,8 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
                 edge_data = self.graph.get_edge_data(entity, neighbor)
                 relation = edge_data.get('relation', 'related_to')
                 relation_content = f"**关系**: {entity} --{relation}--> {neighbor}"
-                relation_score = entity_score * 0.8 # 关系的分数可以适当降低
+                relation_overlap = self._keyword_overlap_score(query, relation_content)
+                relation_score = self._fuse_score(entity_score * 0.8, relation_overlap) # 关系的分数可以适当降低
                 entity_results.append({
                     'content': relation_content,
                     'score': relation_score,
@@ -443,6 +778,6 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         return entity_results
 
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]: #  search 方法现在调用混合搜索
+    def search(self, query: str, top_k: int = 8) -> List[Dict[str, Any]]: #  search 方法现在调用混合搜索
         """修改 search 方法，默认使用混合搜索策略。"""
-        return self.hybrid_search(query, top_k_vector=top_k, top_k_graph=top_k // 2) #  可以调整 top_k_vector 和 top_k_graph 的比例
+        return self.hybrid_search(query, top_k_vector=top_k, top_k_graph=max(2, top_k // 2)) #  可以调整 top_k_vector 和 top_k_graph 的比例
