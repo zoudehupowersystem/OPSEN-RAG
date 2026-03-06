@@ -10,7 +10,8 @@ if __name__ == "__main__":
 
     data_dir = "data"  # 数据目录
     save_dir = "model_files" # 模型保存目录
-    graph_rag = ImprovedGraphRAG(data_dir=data_dir, save_dir=save_dir) # 初始化 ImprovedGraphRAG
+    config_path = "config/rag_config.json"  # 运行时配置文件
+    graph_rag = ImprovedGraphRAG(data_dir=data_dir, save_dir=save_dir, config_path=config_path) # 初始化 ImprovedGraphRAG
 
     # 先预处理 PDF -> Markdown，再决定是否重建模型
     graph_rag.prepare_documents()

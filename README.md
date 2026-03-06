@@ -8,7 +8,7 @@
 *   **知识图谱：** 从文档中提取实体和关系，构建知识图谱（使用 NetworkX），捕捉概念之间的联系。
 *   **文档处理：** 处理 Markdown 文件，智能地将文本分块以进行最佳索引。
 *   **PDF 智能转 Markdown：** 支持将 PDF 自动按页转换为 Markdown（如 `xxx_1.md` 到 `xxx_N.md`），中间渲染图片保存到 `data/figs/`，并通过本地多模态模型（如 `qwen3-vl:8b/30b`）识别公式与附图说明。
-*   **答案生成：** 使用大型语言模型（Ollama 和deepseek-r1:7b）根据检索到的上下文合成答案。
+*   **答案生成：** 使用大型语言模型（Ollama，本地模型名可在配置文件中修改）根据检索到的上下文合成答案。
 *   **持久化：** 保存和加载向量索引和知识图谱，以便高效地重复使用。
 *   **错误处理：** 包含针对文档处理和 JSON 解析的健壮错误处理。
 *   **可定制：** 轻松调整参数，例如检索结果的数量 (top_k)、温度和 LLM 模型。
@@ -87,9 +87,10 @@
 
 5. **准备 Ollama 与模型**
 
+   请根据 `config/rag_config.json` 中 `models` 字段拉取对应模型，例如默认值：
+
    ```bash
-   ollama run deepseek-r1:7b
-   ollama run qwen3-vl:8b
+   ollama run qwen3-vl:30b
    ```
 
 6. **运行程序**
@@ -133,9 +134,10 @@
 
 5. **准备 Ollama 模型**
 
+   请根据 `config/rag_config.json` 中 `models` 字段拉取对应模型，例如默认值：
+
    ```powershell
-   ollama run deepseek-r1:7b
-   ollama run qwen3-vl:8b
+   ollama run qwen3-vl:30b
    ```
 
 6. **运行程序**
@@ -152,10 +154,16 @@
 
 ## 使用方法
 
-> PDF 多模态转换默认使用 `qwen3-vl:8b`（无需 deepseek）。
-> 为降低多页 PDF 的显存峰值，已默认开启“每页请求后释放模型驻留”（`keep_alive=0s`）。
-> 对长页内容默认提高上下文与输出上限（`num_ctx=16384`, `num_predict=4096`）。
+### 配置文件说明（新增）
 
+项目新增了运行时配置文件：`config/rag_config.json`，用于统一管理提示词与本地模型，不再硬编码在 Python 代码中。你可以按需修改：
+
+- `models`：嵌入模型、PDF 多模态模型、实体抽取模型、答案生成模型
+- `prompts`：PDF 转换、实体关系抽取、答案生成提示词
+- `pdf_conversion`：分页转换参数（DPI、重试、上下文长度、输出长度等）
+- `ollama_options`：实体抽取/答案生成的采样参数
+
+> 默认配置已经提供可直接运行的参数；如果仅想切换模型，通常只需改 `models` 字段。
 
 1.  **运行应用程序：**
 
