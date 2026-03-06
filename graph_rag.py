@@ -4,6 +4,7 @@ from io import BytesIO
 import networkx as nx
 import pickle
 import json
+import copy
 import ollama
 from markdown import markdown
 from bs4 import BeautifulSoup
@@ -36,6 +37,83 @@ def _require_dependency(dep_obj, package_name: str, import_error: Exception):
 _embedding_model_singleton = None
 
 
+DEFAULT_RUNTIME_CONFIG = {
+    "models": {
+        "embedding": "shibing624/text2vec-base-chinese",
+        "pdf_vision": "qwen3-vl:30b",
+        "entity_extraction": "qwen3-vl:30b",
+        "answer_generation": "qwen3-vl:30b",
+    },
+    "pdf_conversion": {
+        "page_dpi": 220,
+        "show_llm_interaction": True,
+        "max_retries": 5,
+        "retry_wait_s": 2.0,
+        "release_vram_each_page": True,
+        "num_ctx": 16384,
+        "max_output_tokens": 4096,
+    },
+    "ollama_options": {
+        "entity_extraction": {"temperature": 0.0, "top_p": 0.9},
+        "answer_generation": {"temperature": 0.0, "top_p": 0.9, "repeat_penalty": 1.2},
+    },
+    "prompts": {
+        "pdf_conversion": (
+            "你是一个 PDF 到 Markdown 的专业转换助手。"
+            "请将这页 PDF 内容严格转换为 Markdown，要求：\n"
+            "1) 保留标题、列表、表格和段落结构。\n"
+            "2) 所有公式必须识别为 LaTeX。独立一行公式使用 $$...$$ 包裹并单独成行；"
+            "行内公式使用 $...$。\n"
+            "3) 如果页面有图片，请不要输出图片链接，改为在对应位置写简要中文描述，格式为："
+            "[图示说明：...]。\n"
+            "4) 仅输出 Markdown 内容，不要解释，不要添加额外前后缀。"
+        ),
+        "entity_extraction": (
+            "从以下文本中提取电力系统、高性能计算、AI、工程经验、计算机技术等技术相关的实体和关系（重点是电力系统）。\n"
+            "**请严格按照如下JSON格式输出，不要包含任何额外的文字或说明，不要忘记relations的最后一个\"]\"符号：**\n"
+            "{{\n"
+            "    \"entities\": [\"实体1\", \"实体2\", \"实体3\"],\n"
+            "    \"relations\": [[\"实体1\", \"关系描述\", \"实体2\"], [\"实体1\", \"关系描述\", \"实体3\"],...]\n"
+            "}}\n\n"
+            "文本：{text}\n"
+            "再次强调,输出必须是一个完整的,有效的JSON对象"
+        ),
+        "answer_generation": (
+            "你是电力系统问答助手。请严格基于“知识库信息”回答，优先引用原文证据，减少自行发挥。\n\n"
+            "回答要求：\n"
+            "1. 只回答与电力系统和电力电子技术相关的问题。\n"
+            "2. 回答时先给“证据引用”，再给结论。\n"
+            "3. 每个关键结论后都要附带证据编号，如 [证据1]、[证据3]。\n"
+            "4. 若检索内容不足以支撑结论，明确写“根据当前检索内容无法确定”。\n"
+            "5. 不要编造未在证据中出现的事实。\n\n"
+            "知识库信息：\n"
+            "{context_text}\n\n"
+            "问题：{query}\n"
+        ),
+    },
+}
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge_dict(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def load_runtime_config(config_path: str = "config/rag_config.json") -> Dict[str, Any]:
+    config = copy.deepcopy(DEFAULT_RUNTIME_CONFIG)
+    path = Path(config_path)
+    if path.exists():
+        user_config = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(user_config, dict):
+            raise ValueError(f"配置文件必须是 JSON 对象: {config_path}")
+        _deep_merge_dict(config, user_config)
+    return config
+
+
 def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chinese'):
     """获取共享的文本向量模型实例，避免重复加载权重。"""
     global _embedding_model_singleton
@@ -48,7 +126,7 @@ def get_shared_embedding_model(model_name: str = 'shibing624/text2vec-base-chine
 class PDFToMarkdownConverter:
     """使用多模态模型将 PDF 按页转换为 Markdown。"""
 
-    def __init__(self, model: str = "qwen3-vl:30b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 5, retry_wait_s: float = 2.0, release_vram_each_page: bool = True, num_ctx: int = 16384, max_output_tokens: int = 4096):
+    def __init__(self, model: str = "qwen3-vl:30b", page_dpi: int = 220, show_llm_interaction: bool = True, max_retries: int = 5, retry_wait_s: float = 2.0, release_vram_each_page: bool = True, num_ctx: int = 16384, max_output_tokens: int = 4096, prompt_template: str = ""):
         self.model = model
         self.page_dpi = page_dpi
         self.show_llm_interaction = show_llm_interaction
@@ -57,6 +135,7 @@ class PDFToMarkdownConverter:
         self.release_vram_each_page = release_vram_each_page
         self.num_ctx = num_ctx
         self.max_output_tokens = max_output_tokens
+        self.prompt_template = prompt_template
 
     def get_page_count(self, pdf_path: Path) -> int:
         """获取 PDF 页数。"""
@@ -142,16 +221,7 @@ class PDFToMarkdownConverter:
 
     def _recognize_markdown(self, image_b64: str, page_index: int, pdf_name: str) -> str:
         """通过多模态模型识别页面内容并输出 Markdown（带重试）。"""
-        prompt = (
-            "你是一个 PDF 到 Markdown 的专业转换助手。"
-            "请将这页 PDF 内容严格转换为 Markdown，要求：\n"
-            "1) 保留标题、列表、表格和段落结构。\n"
-            "2) 所有公式必须识别为 LaTeX。独立一行公式使用 $$...$$ 包裹并单独成行；"
-            "行内公式使用 $...$。\n"
-            "3) 如果页面有图片，请不要输出图片链接，改为在对应位置写简要中文描述，格式为："
-            "[图示说明：...]。\n"
-            "4) 仅输出 Markdown 内容，不要解释，不要添加额外前后缀。"
-        )
+        prompt = self.prompt_template.strip()
 
         last_error = None
         for attempt in range(1, self.max_retries + 1):
@@ -204,9 +274,20 @@ class PDFToMarkdownConverter:
         raise RuntimeError(f"LLM识别失败（重试{self.max_retries}次后仍失败，或持续返回空内容）: {last_error}")
 
 class DocumentProcessor:
-    def __init__(self, pdf_model: str = "qwen3-vl:30b", encoder=None, release_vram_each_page: bool = True):
+    def __init__(self, pdf_model: str = "qwen3-vl:30b", encoder=None, release_vram_each_page: bool = True, pdf_conversion_config: Dict[str, Any] = None, pdf_prompt_template: str = ""):
         self.encoder = encoder or get_shared_embedding_model()
-        self.pdf_converter = PDFToMarkdownConverter(model=pdf_model, release_vram_each_page=release_vram_each_page)
+        config = pdf_conversion_config or {}
+        self.pdf_converter = PDFToMarkdownConverter(
+            model=pdf_model,
+            release_vram_each_page=release_vram_each_page,
+            page_dpi=config.get("page_dpi", 220),
+            show_llm_interaction=config.get("show_llm_interaction", True),
+            max_retries=config.get("max_retries", 5),
+            retry_wait_s=config.get("retry_wait_s", 2.0),
+            num_ctx=config.get("num_ctx", 16384),
+            max_output_tokens=config.get("max_output_tokens", 4096),
+            prompt_template=pdf_prompt_template,
+        )
 
     def convert_pdfs_to_markdown(self, data_dir: Path) -> List[Path]:
         """将目录内 PDF 按页转换为 Markdown。"""
@@ -291,7 +372,7 @@ class DocumentProcessor:
         return chunks
 
 class GraphRAG:
-    def __init__(self, data_dir="data", save_dir="model_files"):
+    def __init__(self, data_dir="data", save_dir="model_files", config_path: str = "config/rag_config.json"):
         """
         初始化 GraphRAG。
 
@@ -305,9 +386,18 @@ class GraphRAG:
 
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True) # 确保模型保存目录存在
+        self.runtime_config = load_runtime_config(config_path)
 
-        self.embeddings_model = get_shared_embedding_model()
-        self.processor = DocumentProcessor(encoder=self.embeddings_model)
+        embedding_model_name = self.runtime_config["models"]["embedding"]
+        self.embeddings_model = get_shared_embedding_model(embedding_model_name)
+        pdf_config = self.runtime_config.get("pdf_conversion", {})
+        self.processor = DocumentProcessor(
+            pdf_model=self.runtime_config["models"]["pdf_vision"],
+            encoder=self.embeddings_model,
+            release_vram_each_page=pdf_config.get("release_vram_each_page", True),
+            pdf_conversion_config=pdf_config,
+            pdf_prompt_template=self.runtime_config["prompts"]["pdf_conversion"],
+        )
         self.graph = nx.DiGraph()  # 使用有向图
         self.node_embeddings = {}
         self.graph_save_path = self.save_dir / "graph_data.pkl" # 图谱保存路径
@@ -315,26 +405,13 @@ class GraphRAG:
 
     def extract_entities_and_relations(self, text: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
         """改进的实体关系抽取，增加错误处理和JSON解析的健壮性。"""
-        prompt = f"""
-        从以下文本中提取电力系统、高性能计算、AI、工程经验、计算机技术等技术相关的实体和关系（重点是电力系统）。
-        **请严格按照如下JSON格式输出，不要包含任何额外的文字或说明，不要忘记relations的最后一个"]"符号：**
-        {{
-            "entities": ["实体1", "实体2", "实体3"],
-            "relations": [["实体1", "关系描述", "实体2"], ["实体1", "关系描述", "实体3"],...]
-        }}
-
-        文本：{text}
-        再次强调,输出必须是一个完整的,有效的JSON对象
-        """
+        prompt = self.runtime_config["prompts"]["entity_extraction"].format(text=text)
 
         try:
             response = ollama.generate(
-                model='qwen3-vl:30b',
+                model=self.runtime_config["models"]["entity_extraction"],
                 prompt=prompt,
-                options={
-                    "temperature": 0.0,
-                    "top_p": 0.9
-                }
+                options=self.runtime_config["ollama_options"]["entity_extraction"],
             )
 
             # 清理和规范化 JSON 字符串
@@ -482,32 +559,15 @@ class GraphRAG:
             f"[证据{i+1}] {item['content']}" for i, item in enumerate(context)
         ])
 
-        prompt = f"""
-        你是电力系统问答助手。请严格基于“知识库信息”回答，优先引用原文证据，减少自行发挥。
-
-        回答要求：
-        1. 只回答与电力系统和电力电子技术相关的问题。
-        2. 回答时先给“证据引用”，再给结论。
-        3. 每个关键结论后都要附带证据编号，如 [证据1]、[证据3]。
-        4. 若检索内容不足以支撑结论，明确写“根据当前检索内容无法确定”。
-        5. 不要编造未在证据中出现的事实。
-
-        知识库信息：
-        {context_text}
-
-        问题：{query}
-        """
+        prompt = self.runtime_config["prompts"]["answer_generation"].format(context_text=context_text, query=query)
+        answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
+        answer_options["max_tokens"] = max_tokens
 
         try:
             response = ollama.generate(
-                model="qwen3-vl:30b",
+                model=self.runtime_config["models"]["answer_generation"],
                 prompt=prompt,
-                options={
-                    "temperature": 0.0,
-                    "max_tokens": max_tokens,
-                    "top_p": 0.9,
-                    "repeat_penalty": 1.2
-                }
+                options=answer_options,
             )
             return response['response']
         except Exception as e:
@@ -544,7 +604,7 @@ class GraphRAG:
 
 
 class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
-    def __init__(self, data_dir="data", save_dir="model_files"):
+    def __init__(self, data_dir="data", save_dir="model_files", config_path: str = "config/rag_config.json"):
         """
         初始化 ImprovedGraphRAG，集成 VectorStore。
 
@@ -552,7 +612,7 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
             data_dir (str): 知识库数据目录.
             save_dir (str): 模型文件保存目录，用于存放向量索引和图谱数据.
         """
-        super().__init__(data_dir=data_dir, save_dir=save_dir) # 调用父类 GraphRAG 的初始化方法
+        super().__init__(data_dir=data_dir, save_dir=save_dir, config_path=config_path) # 调用父类 GraphRAG 的初始化方法
         self.vector_store = VectorStore(embedding_size=768, # 假设 sentence-transformers 模型输出维度是 768
                                         index_path=self.save_dir / "vector_index.faiss") # 指定向量索引保存路径
 
