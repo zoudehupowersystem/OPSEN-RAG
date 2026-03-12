@@ -152,6 +152,28 @@
 
 ---
 
+
+### Progressive Disclosure 检索接口（Search / Explore）
+
+为支持“先概览、再下钻”的检索流程，`ImprovedGraphRAG` 新增两个标准 API：
+
+- `Search(query, top_k=8)`：全局定位，返回检索摘要（`summary`）与可展开节点（`expandable_nodes`）。
+- `Explore(node_id, window=1)`：局部下钻，展开指定 `chunk` 的上下文窗口，并返回关联实体/关系。
+
+示例：
+
+```python
+from graph_rag import ImprovedGraphRAG
+
+rag = ImprovedGraphRAG(data_dir="data", save_dir="model_files", config_path="config/rag_config.json")
+rag.load()
+
+overview = rag.Search("暂态稳定评估需要哪些关键指标？")
+if overview["expandable_nodes"]:
+    node_id = overview["expandable_nodes"][0]["node_id"]
+    detail = rag.Explore(node_id, window=1)
+```
+
 ## 使用方法
 
 ### 配置文件说明（新增）

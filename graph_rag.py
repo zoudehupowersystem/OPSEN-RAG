@@ -402,6 +402,7 @@ class GraphRAG:
         self.node_embeddings = {}
         self.graph_save_path = self.save_dir / "graph_data.pkl" # 图谱保存路径
         self.chunk_contents = {} # 存储原始文本块
+        self.chunk_sources = {} # 存储 chunk 来源文件
 
     def extract_entities_and_relations(self, text: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
         """改进的实体关系抽取，增加错误处理和JSON解析的健壮性。"""
@@ -472,6 +473,7 @@ class GraphRAG:
             content = chunk["content"]
             chunk_id = f"chunk_{idx-1}" # 使用 chunk 索引作为 chunk_id
             self.chunk_contents[chunk_id] = content
+            self.chunk_sources[chunk_id] = chunk.get("source", "")
 
             try:
                 entities, relations = self.extract_entities_and_relations(content)
@@ -583,7 +585,8 @@ class GraphRAG:
         data = {
             "graph": self.graph,
             "node_embeddings": self.node_embeddings,
-            "chunk_contents": self.chunk_contents
+            "chunk_contents": self.chunk_contents,
+            "chunk_sources": self.chunk_sources
         }
         with open(self.graph_save_path, "wb") as f:
             pickle.dump(data, f)
@@ -597,6 +600,7 @@ class GraphRAG:
                 self.graph = data["graph"]
                 self.node_embeddings = data["node_embeddings"]
                 self.chunk_contents = data.get("chunk_contents", {})
+                self.chunk_sources = data.get("chunk_sources", {})
             print(f"知识图谱已加载自: {load_path}")
         else:
             print(f"知识图谱文件不存在: {load_path}, 将重新构建图谱")
@@ -732,6 +736,57 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
         return "\n".join(sections)
 
 
+    def Search(self, query: str, top_k: int = 8) -> Dict[str, Any]:
+        """全局定位接口：返回顶层检索摘要与可探索节点。"""
+        results = self.hybrid_search(query, top_k_vector=top_k, top_k_graph=max(2, top_k // 2))
+        nodes = []
+        for item in results:
+            chunk_id = item.get("chunk_id")
+            if not chunk_id:
+                continue
+            nodes.append({
+                "node_id": chunk_id,
+                "document": self.chunk_sources.get(chunk_id, ""),
+                "score": float(item.get("score", 0.0)),
+                "preview": self.chunk_contents.get(chunk_id, "")[:120],
+            })
+
+        return {
+            "query": query,
+            "summary": [
+                {
+                    "source": item.get("source", ""),
+                    "document": item.get("document", ""),
+                    "score": float(item.get("score", 0.0)),
+                    "content": item.get("content", ""),
+                }
+                for item in results
+            ],
+            "expandable_nodes": nodes,
+        }
+
+    def Explore(self, node_id: str, window: int = 1) -> Dict[str, Any]:
+        """局部下钻接口：展开指定节点并返回深度上下文和关系。"""
+        if node_id not in self.chunk_contents:
+            raise KeyError(f"未知节点: {node_id}")
+
+        content = self._expanded_chunk_content(node_id, window=window)
+        entities = [entity for entity, _ in self.graph.in_edges(node_id) if not entity.startswith("chunk_")]
+        relations = []
+        for entity in entities:
+            for _, neighbor in self.graph.out_edges(entity):
+                if not neighbor.startswith("chunk_"):
+                    relation = self.graph.get_edge_data(entity, neighbor).get("relation", "related_to")
+                    relations.append((entity, relation, neighbor))
+
+        return {
+            "node_id": node_id,
+            "document": self.chunk_sources.get(node_id, ""),
+            "content": content,
+            "entities": entities,
+            "relations": relations,
+        }
+
     def hybrid_search(self, query: str, top_k_vector: int = 8, top_k_graph: int = 4) -> List[Dict[str, Any]]:
         """结合向量检索和图谱结构的混合搜索策略。"""
         query_embedding = self.embeddings_model.encode(query)
@@ -758,6 +813,7 @@ class ImprovedGraphRAG(GraphRAG): # 继承自 GraphRAG
                     'content': expanded_content,
                     'score': fused,
                     'source': 'vector_search',
+                    'document': self.chunk_sources.get(chunk_id, ''),
                     'chunk_id': chunk_id,
                     'vector_score': vector_score,
                     'overlap_score': overlap_score
