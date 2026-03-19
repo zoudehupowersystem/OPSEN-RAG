@@ -1,5 +1,6 @@
 from pathlib import Path
 from io import BytesIO
+import os
 import base64
 import copy
 import json
@@ -134,12 +135,81 @@ def load_runtime_config(config_path: str = "config/rag_config.json") -> Dict[str
     return config
 
 
+def _get_hf_cache_roots() -> List[Path]:
+    roots: List[Path] = []
+    env_hf_home = os.environ.get("HF_HOME")
+    env_hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    env_transformers_cache = os.environ.get("TRANSFORMERS_CACHE")
+
+    if env_hub_cache:
+        roots.append(Path(env_hub_cache))
+    if env_transformers_cache:
+        roots.append(Path(env_transformers_cache))
+    if env_hf_home:
+        roots.append(Path(env_hf_home) / "hub")
+
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    roots.append(Path.home() / ".cache" / "torch" / "sentence_transformers")
+
+    unique_roots: List[Path] = []
+    seen = set()
+    for root in roots:
+        key = str(root.expanduser())
+        if key not in seen:
+            seen.add(key)
+            unique_roots.append(root.expanduser())
+    return unique_roots
+
+
+def _has_local_hf_cache(model_name: str) -> bool:
+    model_key = model_name.replace("/", "--")
+    hub_prefix = f"models--{model_key}"
+    sentence_transformer_dirname = model_name.split("/")[-1]
+
+    for root in _get_hf_cache_roots():
+        if not root.exists():
+            continue
+
+        hub_model_dir = root / hub_prefix
+        if hub_model_dir.exists():
+            refs_dir = hub_model_dir / "refs"
+            snapshots_dir = hub_model_dir / "snapshots"
+            if snapshots_dir.exists() and any(snapshots_dir.iterdir()):
+                return True
+            if refs_dir.exists() and any(refs_dir.iterdir()):
+                return True
+            if any(hub_model_dir.glob("**/config.json")):
+                return True
+
+        st_model_dir = root / sentence_transformer_dirname
+        modules_json = st_model_dir / "modules.json"
+        if st_model_dir.exists() and (modules_json.exists() or any(st_model_dir.glob("**/config_sentence_transformers.json"))):
+            return True
+
+    return False
+
+
 def get_shared_embedding_model(model_name: str = "shibing624/text2vec-base-chinese"):
-    """获取共享的文本向量模型实例，避免重复加载权重。"""
+    """获取共享的文本向量模型实例，优先复用本地缓存并避免不必要的联网检查。"""
     global _embedding_model_singleton
     _require_dependency(SentenceTransformer, "sentence-transformers", _sentence_transformers_import_error)
     if model_name not in _embedding_model_singleton:
-        _embedding_model_singleton[model_name] = SentenceTransformer(model_name)
+        local_cache_available = _has_local_hf_cache(model_name)
+        if local_cache_available:
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            print(f"[Embedding] 检测到本地 HuggingFace 缓存，使用离线模式加载: {model_name}")
+        else:
+            print(f"[Embedding] 未检测到本地 HuggingFace 缓存，将按默认模式加载: {model_name}")
+
+        try:
+            _embedding_model_singleton[model_name] = SentenceTransformer(
+                model_name,
+                local_files_only=local_cache_available,
+            )
+        except TypeError:
+            _embedding_model_singleton[model_name] = SentenceTransformer(model_name)
     return _embedding_model_singleton[model_name]
 
 

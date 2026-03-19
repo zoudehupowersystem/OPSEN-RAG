@@ -1,5 +1,3 @@
-from pathlib import Path
-
 if __name__ == "__main__":
     try:
         from graph_rag import ImprovedGraphRAG  # 导入 ImprovedGraphRAG 类
