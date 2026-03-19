@@ -264,6 +264,19 @@ def _canonical_header_footer_text(text: str) -> str:
     return text.strip().lower()
 
 
+def _render_prompt_template(template: str, **kwargs: Any) -> str:
+    """仅替换约定占位符，避免 JSON 花括号被 str.format 误解析。"""
+    rendered = template or ""
+    for key, value in kwargs.items():
+        rendered = rendered.replace(f"{{{key}}}", str(value))
+    return rendered
+
+
+def _natural_sort_key(path_like: Any):
+    text = str(path_like)
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
+
+
 class LocalStructuredPDFExtractor:
     """
     借鉴 OpenDataLoader 的“结构化输出 + 阅读顺序 + local-first”思路，
@@ -1107,7 +1120,7 @@ class GraphRAG:
         self.chunk_metadata: Dict[str, Dict[str, Any]] = {}
 
     def extract_entities_and_relations(self, text: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
-        prompt = self.runtime_config["prompts"]["entity_extraction"].format(text=text)
+        prompt = _render_prompt_template(self.runtime_config["prompts"]["entity_extraction"], text=text)
         try:
             response = ollama.generate(
                 model=self.runtime_config["models"]["entity_extraction"],
@@ -1267,7 +1280,7 @@ class GraphRAG:
             evidence_sections.append(f"[证据{i}] ({location})\n{item.get('content', '')}")
 
         context_text = "\n\n".join(evidence_sections)
-        prompt = self.runtime_config["prompts"]["answer_generation"].format(context_text=context_text, query=query)
+        prompt = _render_prompt_template(self.runtime_config["prompts"]["answer_generation"], context_text=context_text, query=query)
         answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
         answer_options["max_tokens"] = max_tokens
 
@@ -1352,7 +1365,7 @@ class ImprovedGraphRAG(GraphRAG):
     def process_documents(self, show_entity_relations: bool = False):
         all_chunks: List[Dict[str, Any]] = []
         self.prepare_documents()
-        md_files = sorted(self.data_dir.glob("*.md"))
+        md_files = sorted(self.data_dir.glob("*.md"), key=_natural_sort_key)
         total_files = len(md_files)
 
         for idx, md_file in enumerate(md_files, 1):
