@@ -42,7 +42,15 @@ if __name__ == "__main__":
             relevant_context = graph_rag.search(query)
             print("\n检索到的相关内容：")
             for item in relevant_context:
-                print(f"- 来源：{item['source']}") #  显示结果来源
+                print(f"- 来源：{item['source']}")
+                if item.get('pdf_source'):
+                    print(f"- PDF：{item['pdf_source']}")
+                if item.get('page') is not None:
+                    print(f"- 页码：{item['page']}")
+                if item.get('heading'):
+                    print(f"- 标题：{item['heading']}")
+                if item.get('bbox'):
+                    print(f"- BBox：{item['bbox']}")
                 print(f"- 相关度：{item['score']:.3f}")
                 print(f"- 内容：{item['content']}")
                 print()

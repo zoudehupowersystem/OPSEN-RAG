@@ -1,9 +1,0 @@
-networkx
-sentence-transformers
-markdown
-beautifulsoup4
-jieba
-numpy
-faiss-cpu
-ollama
-pymupdf
