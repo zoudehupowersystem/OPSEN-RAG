@@ -277,6 +277,29 @@ def _natural_sort_key(path_like: Any):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
 
 
+_SUSPICIOUS_OCR_FRAGMENTS = [
+    "犌犅",
+    "狆狅狑犲狉",
+    "狊狔狊狋犲犿",
+    "狉狅狋狅狉",
+    "犪狀犵犾犲",
+    "狊狋犪犫犻犾犻狋狔",
+    "狋狉犪狀狊犻犲狀狋",
+    "犱狔狀犪犿犻犮",
+    "狉犲狀犲狑犪犫犾犲",
+]
+_SUSPICIOUS_OCR_RUN_PATTERN = re.compile(r"[犌犅狆狅狑犲狉狊狔狋犿犮狌狀犾犻犱犪犵]{4,}")
+
+
+def _contains_suspicious_ocr_text(text: str) -> bool:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return False
+    if any(fragment in normalized for fragment in _SUSPICIOUS_OCR_FRAGMENTS):
+        return True
+    return bool(_SUSPICIOUS_OCR_RUN_PATTERN.search(normalized))
+
+
 class LocalStructuredPDFExtractor:
     """
     借鉴 OpenDataLoader 的“结构化输出 + 阅读顺序 + local-first”思路，
@@ -335,10 +358,12 @@ class LocalStructuredPDFExtractor:
         elements = self._annotate_page_regions(elements, page_height)
         markdown_text = self._elements_to_markdown(elements)
 
+        suspicious_ocr = _contains_suspicious_ocr_text(raw_text) or _contains_suspicious_ocr_text(markdown_text)
         local_candidate = (
             len(raw_text) >= self.text_density_threshold
             and sum(1 for item in text_blocks if item.get("text")) >= self.min_text_blocks_for_local
             and clean_ratio >= self.clean_char_ratio_threshold
+            and not suspicious_ocr
         )
 
         return {
@@ -347,6 +372,7 @@ class LocalStructuredPDFExtractor:
             "page_size": [round(page_width, 2), round(page_height, 2)],
             "raw_text": raw_text,
             "clean_char_ratio": round(clean_ratio, 4),
+            "suspicious_ocr": suspicious_ocr,
             "recommended_mode": "local" if local_candidate else "llm",
             "elements": elements,
             "markdown": markdown_text,
@@ -801,8 +827,13 @@ class PDFToMarkdownConverter:
             return "local"
         if self.conversion_mode == "llm":
             return "llm"
-        if page_struct and page_struct.get("recommended_mode") == "local":
-            return "local"
+        if page_struct:
+            if page_struct.get("suspicious_ocr"):
+                return "llm"
+            if _contains_suspicious_ocr_text(page_struct.get("raw_text", "")):
+                return "llm"
+            if page_struct.get("recommended_mode") == "local":
+                return "local"
         return "llm"
 
     def _cleanup_stale_outputs(
