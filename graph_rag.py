@@ -709,10 +709,31 @@ class PDFToMarkdownConverter:
         page_count = self.get_page_count(pdf_path)
         return [output_dir / f"{pdf_path.stem}_{i}.json" for i in range(1, page_count + 1)]
 
+    def get_stale_page_indices(self, pdf_path: Path, output_dir: Path) -> List[int]:
+        pdf_mtime = pdf_path.stat().st_mtime
+        stale_pages: List[int] = []
+        page_count = self.get_page_count(pdf_path)
+
+        for page_index in range(1, page_count + 1):
+            output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
+            json_path = output_dir / f"{pdf_path.stem}_{page_index}.json"
+            md_stale = (not output_path.exists()) or output_path.stat().st_mtime < pdf_mtime
+            json_stale = self.export_page_json and ((not json_path.exists()) or json_path.stat().st_mtime < pdf_mtime)
+            if md_stale or json_stale:
+                stale_pages.append(page_index)
+
+        return stale_pages
+
     def convert(self, pdf_path: Path, output_dir: Path) -> List[Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
         fig_dir = output_dir / "figs"
         fig_dir.mkdir(parents=True, exist_ok=True)
+
+        stale_pages = set(self.get_stale_page_indices(pdf_path, output_dir))
+        if not stale_pages:
+            expected_page_files = self.get_expected_page_files(pdf_path, output_dir)
+            print(f"跳过 PDF 转换（分页 Markdown / JSON 已是最新）: {pdf_path.name}")
+            return expected_page_files
 
         structured_pages = self.local_extractor.extract_document(pdf_path)
         doc = fitz.open(pdf_path)
@@ -722,12 +743,24 @@ class PDFToMarkdownConverter:
 
         try:
             total_pages = doc.page_count
-            print(f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页，模式={self.conversion_mode}")
+            stale_page_list = ",".join(str(page) for page in sorted(stale_pages))
+            print(
+                f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页，模式={self.conversion_mode}，"
+                f"仅重建页={stale_page_list}"
+            )
             for page_index, page in enumerate(doc, 1):
                 page_struct = structured_pages[page_index - 1] if page_index - 1 < len(structured_pages) else None
                 output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
                 json_path = output_dir / f"{pdf_path.stem}_{page_index}.json"
                 figure_path = fig_dir / f"{pdf_path.stem}_{page_index}.png"
+                if page_index not in stale_pages:
+                    output_paths.append(output_path)
+                    if self.export_page_json and json_path.exists():
+                        json_paths.append(json_path)
+                    if figure_path.exists():
+                        figure_paths.append(figure_path)
+                    print(f"  -> 跳过第 {page_index}/{total_pages} 页（分页文件已是最新）")
+                    continue
                 try:
                     print(f"  -> 处理第 {page_index}/{total_pages} 页")
                     page_markdown, page_json = self._convert_page(
@@ -965,20 +998,17 @@ class DocumentProcessor:
         converted_files = []
         pdf_files = sorted(data_dir.glob("*.pdf"))
         for pdf_file in pdf_files:
-            expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
-            expected_json_files = self.pdf_converter.get_expected_page_json_files(pdf_file, data_dir)
-            if expected_page_files and all(
-                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
-                for file in expected_page_files
-            ) and all(
-                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
-                for file in expected_json_files
-            ):
+            stale_pages = self.pdf_converter.get_stale_page_indices(pdf_file, data_dir)
+            if not stale_pages:
+                expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
                 print(f"跳过 PDF 转换（分页 Markdown / JSON 已是最新）: {pdf_file.name}")
                 converted_files.extend(expected_page_files)
                 continue
 
-            print(f"开始转换 PDF -> Markdown(按页): {pdf_file.name}")
+            print(
+                f"开始转换 PDF -> Markdown(按页): {pdf_file.name}，"
+                f"待处理页={','.join(str(page) for page in stale_pages)}"
+            )
             try:
                 converted_paths = self.pdf_converter.convert(pdf_file, data_dir)
                 converted_files.extend(converted_paths)
