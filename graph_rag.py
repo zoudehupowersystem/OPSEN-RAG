@@ -1180,15 +1180,26 @@ class GraphRAG:
         self.chunk_contents: Dict[str, str] = {}
         self.chunk_metadata: Dict[str, Dict[str, Any]] = {}
 
-    def extract_entities_and_relations(self, text: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    def extract_entities_and_relations(
+        self,
+        text: str,
+        chunk_label: str = "",
+        source: str = "",
+    ) -> Tuple[List[str], List[Tuple[str, str, str]]]:
         prompt = _render_prompt_template(self.runtime_config["prompts"]["entity_extraction"], text=text)
+        debug_prefix = "[实体关系抽取]"
+        if chunk_label:
+            debug_prefix += f" {chunk_label}"
+        if source:
+            debug_prefix += f" 来源={source}"
+
         try:
             response = ollama.generate(
                 model=self.runtime_config["models"]["entity_extraction"],
                 prompt=prompt,
                 options=self.runtime_config["ollama_options"]["entity_extraction"],
             )
-            response_text = response["response"].strip()
+            response_text = self._normalize_ollama_text(response)
             response_text = re.sub(r"//.*", "", response_text)
             start_idx = response_text.find("{")
             end_idx = response_text.rfind("}") + 1
@@ -1197,7 +1208,12 @@ class GraphRAG:
                 try:
                     result = json.loads(json_str)
                 except json.JSONDecodeError as e:
-                    print(f"JSON解析错误：{e}\n原始JSON字符串：{json_str}")
+                    print(
+                        f"{debug_prefix} JSON解析错误：{e}\n"
+                        f"模型返回预览：{response_text[:300]}\n"
+                        f"截取JSON预览：{json_str[:300]}\n"
+                        f"输入文本预览：{text[:200]}"
+                    )
                     return [], []
 
                 entities = result.get("entities", [])
@@ -1210,10 +1226,17 @@ class GraphRAG:
                         if all(len(x) > 1 for x in [subj, pred, obj]):
                             valid_relations.append((subj, pred, obj))
                 return entities, valid_relations
-            print("未找到有效的JSON结构")
+            print(
+                f"{debug_prefix} 未找到有效的JSON结构\n"
+                f"模型返回预览：{response_text[:300]}\n"
+                f"输入文本预览：{text[:200]}"
+            )
             return [], []
         except Exception as e:
-            print(f"实体关系抽取过程出错: {str(e)}")
+            print(
+                f"{debug_prefix} 实体关系抽取过程出错: {str(e)}\n"
+                f"输入文本预览：{text[:200]}"
+            )
             return [], []
 
     def build_graph(self, all_chunks: List[Dict[str, Any]], force_rebuild: bool = False, show_entity_relations: bool = False):
@@ -1250,7 +1273,11 @@ class GraphRAG:
             self.graph.add_node(chunk_id, node_type="chunk")
 
             try:
-                entities, relations = self.extract_entities_and_relations(content)
+                entities, relations = self.extract_entities_and_relations(
+                    content,
+                    chunk_label=chunk_id,
+                    source=str(chunk.get("source", "")),
+                )
 
                 if show_entity_relations:
                     if entities:
