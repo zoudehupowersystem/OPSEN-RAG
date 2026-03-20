@@ -52,6 +52,9 @@ if __name__ == "__main__":
             if answer:
                 print("\n生成的答案：")
                 print(answer)
+            else:
+                print("\n生成的答案：")
+                print("当前未能生成最终答案，请检查 Ollama 服务、模型可用性或检索结果是否为空。")
 
         except Exception as e:
             print(f"程序执行出错: {e}")

@@ -1296,6 +1296,54 @@ class GraphRAG:
 
         return sorted(results, key=lambda x: x["score"], reverse=True)[:top_k]
 
+    def _normalize_ollama_text(self, response: Any) -> str:
+        if response is None:
+            return ""
+
+        if isinstance(response, dict):
+            text = response.get("response") or response.get("message", {}).get("content", "")
+        else:
+            text = getattr(response, "response", "") or getattr(getattr(response, "message", None), "content", "")
+
+        text = (text or "").strip()
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    def _build_fallback_answer(self, query: str, context: List[Dict[str, Any]]) -> str:
+        evidence_lines = []
+        answer_lines = []
+        for i, item in enumerate(context[:3], 1):
+            source = item.get("source") or item.get("pdf_source") or "unknown"
+            page = item.get("page")
+            heading = item.get("heading")
+            location_bits = [f"来源={source}"]
+            if page is not None:
+                location_bits.append(f"页码={page}")
+            if heading:
+                location_bits.append(f"标题={heading}")
+
+            snippet = re.sub(r"\s+", " ", item.get("content", "")).strip()
+            evidence_lines.append(f"- [证据{i}] {' | '.join(location_bits)}")
+            if snippet:
+                summary = snippet[:220] + ("..." if len(snippet) > 220 else "")
+                answer_lines.append(f"{i}. {summary} [证据{i}]")
+
+        if not answer_lines:
+            return (
+                "一、证据归纳\n"
+                "- 当前未检索到可用证据。\n\n"
+                "二、回答\n"
+                f"根据当前检索内容，无法回答“{query}”。"
+            )
+
+        return (
+            "一、证据归纳\n"
+            + "\n".join(evidence_lines)
+            + "\n\n二、回答\n"
+            + "\n".join(answer_lines)
+            + "\n\n三、不确定性与适用条件\n"
+            + "- 本回答由检索结果自动整理生成，因为答案模型返回了空内容；建议复核上述证据原文。"
+        )
+
     def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 800) -> Optional[str]:
         evidence_sections = []
         for i, item in enumerate(context, 1):
@@ -1313,7 +1361,7 @@ class GraphRAG:
         context_text = "\n\n".join(evidence_sections)
         prompt = _render_prompt_template(self.runtime_config["prompts"]["answer_generation"], context_text=context_text, query=query)
         answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
-        answer_options["max_tokens"] = max_tokens
+        answer_options["num_predict"] = max_tokens
 
         try:
             response = ollama.generate(
@@ -1321,9 +1369,17 @@ class GraphRAG:
                 prompt=prompt,
                 options=answer_options,
             )
-            return response["response"]
+            answer_text = self._normalize_ollama_text(response)
+            if answer_text:
+                return answer_text
+
+            print("答案模型返回空内容，已切换为基于检索证据的兜底答案。")
+            return self._build_fallback_answer(query, context)
         except Exception as e:
             print(f"生成答案失败: {e}")
+            if context:
+                print("已切换为基于检索证据的兜底答案。")
+                return self._build_fallback_answer(query, context)
             return None
 
     def cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
