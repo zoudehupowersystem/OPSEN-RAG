@@ -48,7 +48,7 @@ DEFAULT_RUNTIME_CONFIG = {
         "answer_generation": "qwen3-vl:30b",
     },
     "pdf_conversion": {
-        "mode": "auto",  # auto | local | llm
+        "mode": "llm",  # llm | auto | local
         "page_dpi": 220,
         "show_llm_interaction": True,
         "max_retries": 5,

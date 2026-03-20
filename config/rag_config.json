@@ -6,7 +6,7 @@
     "answer_generation": "qwen3.5:9b"
   },
   "pdf_conversion": {
-    "mode": "auto",
+    "mode": "llm",
     "page_dpi": 220,
     "show_llm_interaction": true,
     "max_retries": 5,
