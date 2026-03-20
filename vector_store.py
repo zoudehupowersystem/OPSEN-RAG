@@ -17,6 +17,11 @@ class VectorStore:
         self.id_to_chunk_id = [] # 存储索引 ID 到 chunk_id 的映射
         self.index_path = Path(index_path) if index_path else None
 
+    def reset(self):
+        """重置索引与 chunk_id 映射，用于从零开始重建。"""
+        self.index = faiss.IndexFlatL2(self.embedding_size)
+        self.id_to_chunk_id = []
+
     def add_item(self, embedding, chunk_id):
         """添加单个向量到索引。"""
         embedding = embedding.astype('float32').reshape(1, -1) # 确保数据类型和形状
@@ -65,10 +70,14 @@ class VectorStore:
         load_path = Path(load_path)
         if load_path.exists():
             self.index = faiss.read_index(str(load_path))
-            with open(str(load_path.with_suffix('.pkl')), 'rb') as f:
+            mapping_path = load_path.with_suffix('.pkl')
+            if not mapping_path.exists():
+                raise FileNotFoundError(f"FAISS 映射文件不存在: {mapping_path}")
+            with open(str(mapping_path), 'rb') as f:
                 self.id_to_chunk_id = pickle.load(f)
             print(f"FAISS 索引已加载自: {load_path}")
         else:
+            self.reset()
             print(f"FAISS 索引文件不存在: {load_path}, 将重新构建索引")
 
     def is_empty(self):
