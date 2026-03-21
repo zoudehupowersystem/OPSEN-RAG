@@ -1399,9 +1399,6 @@ class GraphRAG:
         if len(normalized) < 32:
             return False
 
-        if normalized[-1] not in "。！？.!?)）】]}」』\"'”":
-            return True
-
         suspicious_tails = (
             "主要分为以下",
             "可分为以下",
@@ -1410,6 +1407,10 @@ class GraphRAG:
             "分别为",
             "以及若干子类",
             "具体如下",
+            "目的是",
+            "其目的是",
+            "用于",
+            "包括",
         )
         return any(normalized.endswith(tail) for tail in suspicious_tails)
 
