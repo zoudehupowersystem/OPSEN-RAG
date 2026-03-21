@@ -73,11 +73,6 @@ DEFAULT_RUNTIME_CONFIG = {
         "candidate_multiplier": 4,
         "candidate_floor": 20,
     },
-    "answer_context": {
-        "max_items": 4,
-        "max_chars_per_item": 900,
-        "max_total_chars": 3200,
-    },
     "ollama_options": {
         "entity_extraction": {"temperature": 0.0, "top_p": 0.9},
         "answer_generation": {"temperature": 0.0, "top_p": 0.9, "repeat_penalty": 1.2},
@@ -1453,53 +1448,9 @@ class GraphRAG:
             + "- 本回答由检索结果自动整理生成，因为答案模型返回了空内容；建议复核上述证据原文。"
         )
 
-    def _prepare_answer_context(self, context: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        context_cfg = self.runtime_config.get("answer_context", {})
-        max_items = max(1, int(context_cfg.get("max_items", 4)))
-        max_chars_per_item = max(200, int(context_cfg.get("max_chars_per_item", 900)))
-        max_total_chars = max(max_chars_per_item, int(context_cfg.get("max_total_chars", 3200)))
-
-        prioritized = sorted(
-            context,
-            key=lambda item: (
-                0 if str(item.get("source", "")).startswith("data") else 1,
-                -_safe_float(item.get("score")),
-            ),
-        )
-
-        selected: List[Dict[str, Any]] = []
-        total_chars = 0
-        for item in prioritized:
-            if len(selected) >= max_items:
-                break
-
-            trimmed = dict(item)
-            content = re.sub(r"\s+", " ", str(item.get("content", ""))).strip()
-            if not content:
-                continue
-
-            remaining = max_total_chars - total_chars
-            if remaining < 200:
-                break
-
-            per_item_limit = min(max_chars_per_item, remaining)
-            if len(content) > per_item_limit:
-                content = content[:per_item_limit].rstrip() + " ..."
-            trimmed["content"] = content
-
-            selected.append(trimmed)
-            total_chars += len(content)
-
-        print(
-            f"答案生成上下文已压缩：原始证据 {len(context)} 条，"
-            f"送入模型 {len(selected)} 条，约 {total_chars} 字符"
-        )
-        return selected or context[:1]
-
     def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 1200) -> Optional[str]:
-        answer_context = self._prepare_answer_context(context)
         evidence_sections = []
-        for i, item in enumerate(answer_context, 1):
+        for i, item in enumerate(context, 1):
             source = item.get("source") or item.get("pdf_source") or "unknown"
             page = item.get("page")
             heading = item.get("heading")
@@ -1528,7 +1479,7 @@ class GraphRAG:
                 answer_text = self._normalize_ollama_text(response)
                 if not answer_text:
                     print("答案模型返回空内容，已切换为基于检索证据的兜底答案。")
-                    return self._build_fallback_answer(query, answer_context)
+                    return self._build_fallback_answer(query, context)
 
                 response_meta = self._get_ollama_response_meta(response)
                 if self._looks_truncated_answer(answer_text, response_meta):
@@ -1539,16 +1490,16 @@ class GraphRAG:
                     if attempt < len(token_budgets):
                         continue
                     print("多次生成后答案仍疑似截断，已切换为基于检索证据的兜底答案。")
-                    return self._build_fallback_answer(query, answer_context)
+                    return self._build_fallback_answer(query, context)
 
                 return answer_text
             except Exception as e:
                 last_error = e
                 print(f"生成答案失败: {e}")
 
-        if answer_context:
+        if context:
             print("已切换为基于检索证据的兜底答案。")
-            return self._build_fallback_answer(query, answer_context)
+            return self._build_fallback_answer(query, context)
         if last_error:
             print(f"答案生成最终失败: {last_error}")
         return None
