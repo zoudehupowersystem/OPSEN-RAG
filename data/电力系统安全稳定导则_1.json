@@ -11,8 +11,8 @@
       "id": "p1_llm_1",
       "type": "paragraph",
       "level": null,
-      "text": "中华人民共和国国家标准 [图示说明：GB 标志] GB 38755—2019 代替 DL 755—2001 电力系统安全稳定导则 Code on security and stability for power system 2019-12-31 发布 2020-07-01 实施 国家市场监督管理总局 国家标准化管理委员会 发布",
-      "markdown": "## 中华人民共和国国家标准\n\n[图示说明：GB 标志]\n\nGB 38755—2019  \n代替 DL 755—2001  \n\n## 电力系统安全稳定导则  \n\nCode on security and stability for power system  \n\n2019-12-31 发布  2020-07-01 实施  \n\n国家市场监督管理总局  \n国家标准化管理委员会 发布",
+      "text": "ICS 29.020 F 21 [GB 标志] 中华人民共和国国家标准 GB 38755—2019 代替 DL 755—2001 电力系统安全稳定导则 Code on security and stability for power system 2019-12-31 发布 2020-07-01 实施 国家市场监督管理总局 国家标准化管理委员会 发布",
+      "markdown": "ICS 29.020  \nF 21  \n\n[GB 标志]  \n\n## 中华人民共和国国家标准  \n\nGB 38755—2019  \n代替 DL 755—2001  \n\n### 电力系统安全稳定导则  \n\nCode on security and stability for power system  \n\n2019-12-31 发布  \n2020-07-01 实施  \n\n国家市场监督管理总局  \n国家标准化管理委员会 发布",
       "bbox": [
         0.0,
         0.0,

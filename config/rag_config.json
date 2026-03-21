@@ -1,12 +1,12 @@
 {
   "models": {
     "embedding": "shibing624/text2vec-base-chinese",
-    "pdf_vision": "qwen3-vl:30b",
+    "pdf_vision": "qwen3.5:9b",
     "entity_extraction": "qwen3.5:9b",
     "answer_generation": "qwen3.5:9b"
   },
   "pdf_conversion": {
-    "mode": "auto",
+    "mode": "llm",
     "page_dpi": 220,
     "show_llm_interaction": true,
     "max_retries": 5,

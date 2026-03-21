@@ -48,7 +48,7 @@ DEFAULT_RUNTIME_CONFIG = {
         "answer_generation": "qwen3-vl:30b",
     },
     "pdf_conversion": {
-        "mode": "auto",  # auto | local | llm
+        "mode": "llm",  # llm | auto | local
         "page_dpi": 220,
         "show_llm_interaction": True,
         "max_retries": 5,
@@ -709,10 +709,31 @@ class PDFToMarkdownConverter:
         page_count = self.get_page_count(pdf_path)
         return [output_dir / f"{pdf_path.stem}_{i}.json" for i in range(1, page_count + 1)]
 
+    def get_stale_page_indices(self, pdf_path: Path, output_dir: Path) -> List[int]:
+        pdf_mtime = pdf_path.stat().st_mtime
+        stale_pages: List[int] = []
+        page_count = self.get_page_count(pdf_path)
+
+        for page_index in range(1, page_count + 1):
+            output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
+            json_path = output_dir / f"{pdf_path.stem}_{page_index}.json"
+            md_stale = (not output_path.exists()) or output_path.stat().st_mtime < pdf_mtime
+            json_stale = self.export_page_json and ((not json_path.exists()) or json_path.stat().st_mtime < pdf_mtime)
+            if md_stale or json_stale:
+                stale_pages.append(page_index)
+
+        return stale_pages
+
     def convert(self, pdf_path: Path, output_dir: Path) -> List[Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
         fig_dir = output_dir / "figs"
         fig_dir.mkdir(parents=True, exist_ok=True)
+
+        stale_pages = set(self.get_stale_page_indices(pdf_path, output_dir))
+        if not stale_pages:
+            expected_page_files = self.get_expected_page_files(pdf_path, output_dir)
+            print(f"跳过 PDF 转换（分页 Markdown / JSON 已是最新）: {pdf_path.name}")
+            return expected_page_files
 
         structured_pages = self.local_extractor.extract_document(pdf_path)
         doc = fitz.open(pdf_path)
@@ -722,12 +743,24 @@ class PDFToMarkdownConverter:
 
         try:
             total_pages = doc.page_count
-            print(f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页，模式={self.conversion_mode}")
+            stale_page_list = ",".join(str(page) for page in sorted(stale_pages))
+            print(
+                f"开始逐页处理 {pdf_path.name}，共 {total_pages} 页，模式={self.conversion_mode}，"
+                f"仅重建页={stale_page_list}"
+            )
             for page_index, page in enumerate(doc, 1):
                 page_struct = structured_pages[page_index - 1] if page_index - 1 < len(structured_pages) else None
                 output_path = output_dir / f"{pdf_path.stem}_{page_index}.md"
                 json_path = output_dir / f"{pdf_path.stem}_{page_index}.json"
                 figure_path = fig_dir / f"{pdf_path.stem}_{page_index}.png"
+                if page_index not in stale_pages:
+                    output_paths.append(output_path)
+                    if self.export_page_json and json_path.exists():
+                        json_paths.append(json_path)
+                    if figure_path.exists():
+                        figure_paths.append(figure_path)
+                    print(f"  -> 跳过第 {page_index}/{total_pages} 页（分页文件已是最新）")
+                    continue
                 try:
                     print(f"  -> 处理第 {page_index}/{total_pages} 页")
                     page_markdown, page_json = self._convert_page(
@@ -965,20 +998,17 @@ class DocumentProcessor:
         converted_files = []
         pdf_files = sorted(data_dir.glob("*.pdf"))
         for pdf_file in pdf_files:
-            expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
-            expected_json_files = self.pdf_converter.get_expected_page_json_files(pdf_file, data_dir)
-            if expected_page_files and all(
-                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
-                for file in expected_page_files
-            ) and all(
-                file.exists() and file.stat().st_mtime >= pdf_file.stat().st_mtime
-                for file in expected_json_files
-            ):
+            stale_pages = self.pdf_converter.get_stale_page_indices(pdf_file, data_dir)
+            if not stale_pages:
+                expected_page_files = self.pdf_converter.get_expected_page_files(pdf_file, data_dir)
                 print(f"跳过 PDF 转换（分页 Markdown / JSON 已是最新）: {pdf_file.name}")
                 converted_files.extend(expected_page_files)
                 continue
 
-            print(f"开始转换 PDF -> Markdown(按页): {pdf_file.name}")
+            print(
+                f"开始转换 PDF -> Markdown(按页): {pdf_file.name}，"
+                f"待处理页={','.join(str(page) for page in stale_pages)}"
+            )
             try:
                 converted_paths = self.pdf_converter.convert(pdf_file, data_dir)
                 converted_files.extend(converted_paths)
@@ -1150,15 +1180,27 @@ class GraphRAG:
         self.chunk_contents: Dict[str, str] = {}
         self.chunk_metadata: Dict[str, Dict[str, Any]] = {}
 
-    def extract_entities_and_relations(self, text: str) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+    def extract_entities_and_relations(
+        self,
+        text: str,
+        chunk_label: str = "",
+        source: str = "",
+    ) -> Tuple[List[str], List[Tuple[str, str, str]]]:
         prompt = _render_prompt_template(self.runtime_config["prompts"]["entity_extraction"], text=text)
+        debug_prefix = "[实体关系抽取]"
+        if chunk_label:
+            debug_prefix += f" {chunk_label}"
+        if source:
+            debug_prefix += f" 来源={source}"
+
         try:
             response = ollama.generate(
                 model=self.runtime_config["models"]["entity_extraction"],
                 prompt=prompt,
                 options=self.runtime_config["ollama_options"]["entity_extraction"],
+                think=False,
             )
-            response_text = response["response"].strip()
+            response_text = self._normalize_ollama_text(response)
             response_text = re.sub(r"//.*", "", response_text)
             start_idx = response_text.find("{")
             end_idx = response_text.rfind("}") + 1
@@ -1167,7 +1209,12 @@ class GraphRAG:
                 try:
                     result = json.loads(json_str)
                 except json.JSONDecodeError as e:
-                    print(f"JSON解析错误：{e}\n原始JSON字符串：{json_str}")
+                    print(
+                        f"{debug_prefix} JSON解析错误：{e}\n"
+                        f"模型返回预览：{response_text[:300]}\n"
+                        f"截取JSON预览：{json_str[:300]}\n"
+                        f"输入文本预览：{text[:200]}"
+                    )
                     return [], []
 
                 entities = result.get("entities", [])
@@ -1180,10 +1227,17 @@ class GraphRAG:
                         if all(len(x) > 1 for x in [subj, pred, obj]):
                             valid_relations.append((subj, pred, obj))
                 return entities, valid_relations
-            print("未找到有效的JSON结构")
+            print(
+                f"{debug_prefix} 未找到有效的JSON结构\n"
+                f"模型返回预览：{response_text[:300]}\n"
+                f"输入文本预览：{text[:200]}"
+            )
             return [], []
         except Exception as e:
-            print(f"实体关系抽取过程出错: {str(e)}")
+            print(
+                f"{debug_prefix} 实体关系抽取过程出错: {str(e)}\n"
+                f"输入文本预览：{text[:200]}"
+            )
             return [], []
 
     def build_graph(self, all_chunks: List[Dict[str, Any]], force_rebuild: bool = False, show_entity_relations: bool = False):
@@ -1220,7 +1274,11 @@ class GraphRAG:
             self.graph.add_node(chunk_id, node_type="chunk")
 
             try:
-                entities, relations = self.extract_entities_and_relations(content)
+                entities, relations = self.extract_entities_and_relations(
+                    content,
+                    chunk_label=chunk_id,
+                    source=str(chunk.get("source", "")),
+                )
 
                 if show_entity_relations:
                     if entities:
@@ -1296,7 +1354,121 @@ class GraphRAG:
 
         return sorted(results, key=lambda x: x["score"], reverse=True)[:top_k]
 
-    def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 800) -> Optional[str]:
+    def _normalize_ollama_text(self, response: Any) -> str:
+        if response is None:
+            return ""
+
+        if isinstance(response, dict):
+            text = response.get("response") or response.get("message", {}).get("content", "")
+        else:
+            text = getattr(response, "response", "") or getattr(getattr(response, "message", None), "content", "")
+
+        text = (text or "").strip()
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    def _get_ollama_response_meta(self, response: Any) -> Dict[str, Any]:
+        if response is None:
+            return {}
+
+        keys = [
+            "done",
+            "done_reason",
+            "eval_count",
+            "prompt_eval_count",
+            "model",
+        ]
+        meta: Dict[str, Any] = {}
+        for key in keys:
+            if isinstance(response, dict):
+                value = response.get(key)
+            else:
+                value = getattr(response, key, None)
+            if value is not None:
+                meta[key] = value
+        return meta
+
+    def _looks_truncated_answer(self, answer_text: str, response_meta: Dict[str, Any]) -> bool:
+        if not answer_text:
+            return False
+
+        done_reason = str(response_meta.get("done_reason", "")).lower()
+        if done_reason == "length":
+            return True
+
+        normalized = answer_text.rstrip()
+        if len(normalized) < 32:
+            return False
+
+        suspicious_tails = (
+            "主要分为以下",
+            "可分为以下",
+            "包括以下",
+            "如下",
+            "分别为",
+            "以及若干子类",
+            "具体如下",
+            "目的是",
+            "其目的是",
+            "用于",
+            "包括",
+        )
+        return any(normalized.endswith(tail) for tail in suspicious_tails)
+
+    def _build_fallback_answer(self, query: str, context: List[Dict[str, Any]]) -> str:
+        query_terms = {w.strip() for w in jieba.cut(query) if len(w.strip()) > 1}
+
+        def _fallback_rank(item: Dict[str, Any]) -> Tuple[float, float]:
+            content = str(item.get("content", ""))
+            overlap = 0.0
+            if query_terms:
+                content_terms = {w.strip() for w in jieba.cut(content) if len(w.strip()) > 1}
+                if content_terms:
+                    overlap = len(query_terms & content_terms) / max(len(query_terms), 1)
+
+            penalty = 0.0
+            for bad in ("目次", "前言", "引言", "ICS ", "Code on security and stability"):
+                if bad in content:
+                    penalty += 0.2
+
+            return (overlap - penalty, _safe_float(item.get("score")))
+
+        evidence_lines = []
+        answer_lines = []
+        ranked_context = sorted(context, key=_fallback_rank, reverse=True)
+        for i, item in enumerate(ranked_context[:3], 1):
+            source = item.get("source") or item.get("pdf_source") or "unknown"
+            page = item.get("page")
+            heading = item.get("heading")
+            location_bits = [f"来源={source}"]
+            if page is not None:
+                location_bits.append(f"页码={page}")
+            if heading:
+                location_bits.append(f"标题={heading}")
+
+            snippet = re.sub(r"\s+", " ", item.get("content", "")).strip()
+            evidence_lines.append(f"- [证据{i}] {' | '.join(location_bits)}")
+            if snippet:
+                summary = snippet[:220] + ("..." if len(snippet) > 220 else "")
+                answer_lines.append(f"{i}. {summary} [证据{i}]")
+
+        if not answer_lines:
+            return (
+                "一、证据归纳\n"
+                "- 当前未检索到可用证据。\n\n"
+                "二、回答\n"
+                f"根据当前检索内容，无法回答“{query}”。"
+            )
+
+        return (
+            "一、证据归纳\n"
+            + "\n".join(evidence_lines)
+            + "\n\n二、回答\n"
+            + "\n".join(answer_lines)
+            + "\n\n三、不确定性与适用条件\n"
+            + "- 本回答由检索结果自动整理生成，因为答案模型返回了空内容；建议复核上述证据原文。"
+        )
+
+    def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 1200) -> Optional[str]:
         evidence_sections = []
         for i, item in enumerate(context, 1):
             source = item.get("source") or item.get("pdf_source") or "unknown"
@@ -1312,19 +1484,50 @@ class GraphRAG:
 
         context_text = "\n\n".join(evidence_sections)
         prompt = _render_prompt_template(self.runtime_config["prompts"]["answer_generation"], context_text=context_text, query=query)
-        answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
-        answer_options["max_tokens"] = max_tokens
+        token_budgets = [max_tokens, max(max_tokens * 2, 1800)]
+        last_error = None
 
-        try:
-            response = ollama.generate(
-                model=self.runtime_config["models"]["answer_generation"],
-                prompt=prompt,
-                options=answer_options,
-            )
-            return response["response"]
-        except Exception as e:
-            print(f"生成答案失败: {e}")
-            return None
+        for attempt, token_budget in enumerate(token_budgets, 1):
+            answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
+            answer_options["num_predict"] = token_budget
+            try:
+                response = ollama.generate(
+                    model=self.runtime_config["models"]["answer_generation"],
+                    prompt=prompt,
+                    options=answer_options,
+                    think=False,
+                )
+                answer_text = self._normalize_ollama_text(response)
+                if not answer_text:
+                    response_meta = self._get_ollama_response_meta(response)
+                    print(
+                        "答案模型返回空内容，已切换为基于检索证据的兜底答案。"
+                        f" 返回信息: {response_meta}"
+                    )
+                    return self._build_fallback_answer(query, context)
+
+                response_meta = self._get_ollama_response_meta(response)
+                if self._looks_truncated_answer(answer_text, response_meta):
+                    print(
+                        f"检测到答案可能被截断（attempt={attempt}, num_predict={token_budget}, "
+                        f"done_reason={response_meta.get('done_reason')}），准备重试。"
+                    )
+                    if attempt < len(token_budgets):
+                        continue
+                    print("多次生成后答案仍疑似截断，已切换为基于检索证据的兜底答案。")
+                    return self._build_fallback_answer(query, context)
+
+                return answer_text
+            except Exception as e:
+                last_error = e
+                print(f"生成答案失败: {e}")
+
+        if context:
+            print("已切换为基于检索证据的兜底答案。")
+            return self._build_fallback_answer(query, context)
+        if last_error:
+            print(f"答案生成最终失败: {last_error}")
+        return None
 
     def cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         denom = np.linalg.norm(vec1) * np.linalg.norm(vec2)
