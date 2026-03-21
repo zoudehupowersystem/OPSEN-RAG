@@ -1198,6 +1198,7 @@ class GraphRAG:
                 model=self.runtime_config["models"]["entity_extraction"],
                 prompt=prompt,
                 options=self.runtime_config["ollama_options"]["entity_extraction"],
+                think=False,
             )
             response_text = self._normalize_ollama_text(response)
             response_text = re.sub(r"//.*", "", response_text)
@@ -1413,9 +1414,27 @@ class GraphRAG:
         return any(normalized.endswith(tail) for tail in suspicious_tails)
 
     def _build_fallback_answer(self, query: str, context: List[Dict[str, Any]]) -> str:
+        query_terms = {w.strip() for w in jieba.cut(query) if len(w.strip()) > 1}
+
+        def _fallback_rank(item: Dict[str, Any]) -> Tuple[float, float]:
+            content = str(item.get("content", ""))
+            overlap = 0.0
+            if query_terms:
+                content_terms = {w.strip() for w in jieba.cut(content) if len(w.strip()) > 1}
+                if content_terms:
+                    overlap = len(query_terms & content_terms) / max(len(query_terms), 1)
+
+            penalty = 0.0
+            for bad in ("目次", "前言", "引言", "ICS ", "Code on security and stability"):
+                if bad in content:
+                    penalty += 0.2
+
+            return (overlap - penalty, _safe_float(item.get("score")))
+
         evidence_lines = []
         answer_lines = []
-        for i, item in enumerate(context[:3], 1):
+        ranked_context = sorted(context, key=_fallback_rank, reverse=True)
+        for i, item in enumerate(ranked_context[:3], 1):
             source = item.get("source") or item.get("pdf_source") or "unknown"
             page = item.get("page")
             heading = item.get("heading")
@@ -1475,10 +1494,15 @@ class GraphRAG:
                     model=self.runtime_config["models"]["answer_generation"],
                     prompt=prompt,
                     options=answer_options,
+                    think=False,
                 )
                 answer_text = self._normalize_ollama_text(response)
                 if not answer_text:
-                    print("答案模型返回空内容，已切换为基于检索证据的兜底答案。")
+                    response_meta = self._get_ollama_response_meta(response)
+                    print(
+                        "答案模型返回空内容，已切换为基于检索证据的兜底答案。"
+                        f" 返回信息: {response_meta}"
+                    )
                     return self._build_fallback_answer(query, context)
 
                 response_meta = self._get_ollama_response_meta(response)
