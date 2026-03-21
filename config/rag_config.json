@@ -31,6 +31,11 @@
     "candidate_multiplier": 4,
     "candidate_floor": 20
   },
+  "answer_context": {
+    "max_items": 4,
+    "max_chars_per_item": 900,
+    "max_total_chars": 3200
+  },
   "ollama_options": {
     "entity_extraction": {
       "temperature": 0.0,
