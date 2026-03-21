@@ -1365,6 +1365,53 @@ class GraphRAG:
         text = (text or "").strip()
         return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
 
+    def _get_ollama_response_meta(self, response: Any) -> Dict[str, Any]:
+        if response is None:
+            return {}
+
+        keys = [
+            "done",
+            "done_reason",
+            "eval_count",
+            "prompt_eval_count",
+            "model",
+        ]
+        meta: Dict[str, Any] = {}
+        for key in keys:
+            if isinstance(response, dict):
+                value = response.get(key)
+            else:
+                value = getattr(response, key, None)
+            if value is not None:
+                meta[key] = value
+        return meta
+
+    def _looks_truncated_answer(self, answer_text: str, response_meta: Dict[str, Any]) -> bool:
+        if not answer_text:
+            return False
+
+        done_reason = str(response_meta.get("done_reason", "")).lower()
+        if done_reason == "length":
+            return True
+
+        normalized = answer_text.rstrip()
+        if len(normalized) < 32:
+            return False
+
+        if normalized[-1] not in "。！？.!?)）】]}」』\"'”":
+            return True
+
+        suspicious_tails = (
+            "主要分为以下",
+            "可分为以下",
+            "包括以下",
+            "如下",
+            "分别为",
+            "以及若干子类",
+            "具体如下",
+        )
+        return any(normalized.endswith(tail) for tail in suspicious_tails)
+
     def _build_fallback_answer(self, query: str, context: List[Dict[str, Any]]) -> str:
         evidence_lines = []
         answer_lines = []
@@ -1401,7 +1448,7 @@ class GraphRAG:
             + "- 本回答由检索结果自动整理生成，因为答案模型返回了空内容；建议复核上述证据原文。"
         )
 
-    def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 800) -> Optional[str]:
+    def generate_answer(self, query: str, context: List[Dict[str, Any]], max_tokens: int = 1200) -> Optional[str]:
         evidence_sections = []
         for i, item in enumerate(context, 1):
             source = item.get("source") or item.get("pdf_source") or "unknown"
@@ -1417,27 +1464,45 @@ class GraphRAG:
 
         context_text = "\n\n".join(evidence_sections)
         prompt = _render_prompt_template(self.runtime_config["prompts"]["answer_generation"], context_text=context_text, query=query)
-        answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
-        answer_options["num_predict"] = max_tokens
+        token_budgets = [max_tokens, max(max_tokens * 2, 1800)]
+        last_error = None
 
-        try:
-            response = ollama.generate(
-                model=self.runtime_config["models"]["answer_generation"],
-                prompt=prompt,
-                options=answer_options,
-            )
-            answer_text = self._normalize_ollama_text(response)
-            if answer_text:
+        for attempt, token_budget in enumerate(token_budgets, 1):
+            answer_options = dict(self.runtime_config["ollama_options"]["answer_generation"])
+            answer_options["num_predict"] = token_budget
+            try:
+                response = ollama.generate(
+                    model=self.runtime_config["models"]["answer_generation"],
+                    prompt=prompt,
+                    options=answer_options,
+                )
+                answer_text = self._normalize_ollama_text(response)
+                if not answer_text:
+                    print("答案模型返回空内容，已切换为基于检索证据的兜底答案。")
+                    return self._build_fallback_answer(query, context)
+
+                response_meta = self._get_ollama_response_meta(response)
+                if self._looks_truncated_answer(answer_text, response_meta):
+                    print(
+                        f"检测到答案可能被截断（attempt={attempt}, num_predict={token_budget}, "
+                        f"done_reason={response_meta.get('done_reason')}），准备重试。"
+                    )
+                    if attempt < len(token_budgets):
+                        continue
+                    print("多次生成后答案仍疑似截断，已切换为基于检索证据的兜底答案。")
+                    return self._build_fallback_answer(query, context)
+
                 return answer_text
+            except Exception as e:
+                last_error = e
+                print(f"生成答案失败: {e}")
 
-            print("答案模型返回空内容，已切换为基于检索证据的兜底答案。")
+        if context:
+            print("已切换为基于检索证据的兜底答案。")
             return self._build_fallback_answer(query, context)
-        except Exception as e:
-            print(f"生成答案失败: {e}")
-            if context:
-                print("已切换为基于检索证据的兜底答案。")
-                return self._build_fallback_answer(query, context)
-            return None
+        if last_error:
+            print(f"答案生成最终失败: {last_error}")
+        return None
 
     def cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
         denom = np.linalg.norm(vec1) * np.linalg.norm(vec2)
